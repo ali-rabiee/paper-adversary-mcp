@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paper-adversary-mcp"
+version = "0.1.0"
+description = "Local MCP server that runs an isolated multi-agent adversarial review of research papers and ideas on a Claude plan (via headless Claude Code)."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=2.2,<3",
+    "pyyaml>=6",
+    "pymupdf>=1.24",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+paper-adversary = "paper_adversary.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

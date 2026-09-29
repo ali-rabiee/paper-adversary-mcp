@@ -1,0 +1,10 @@
+runs/
+.env
+*.pdf
+!tests/fixtures/*.pdf
+__pycache__/
+.venv/
+*.egg-info/
+.pytest_cache/
+build/
+dist/

@@ -1,0 +1,78 @@
+# Model registry. Pipeline config refers to models by alias; this file maps each
+# alias to the model ID passed to `claude --model` and holds the published limits
+# and API-equivalent prices used for cost *estimates*.
+#
+# You run on a Claude plan, so nothing here is billed. Claude Code reports its own
+# API-equivalent cost per agent (`total_cost_usd`), and get_run_cost shows it next
+# to the estimate computed from these prices. Keep both honest: update this file
+# when pricing changes.
+#
+# Sources (retrieved 2026-09-29):
+#   https://platform.claude.com/docs/en/about-claude/pricing
+#   https://platform.claude.com/docs/en/about-claude/models/overview
+#
+# context_window is the documented API limit. The provider preflight replaces it
+# with the window Claude Code reports for your plan (modelUsage.contextWindow).
+
+pricing_source: "https://platform.claude.com/docs/en/about-claude/pricing (retrieved 2026-09-29)"
+web_search_usd_per_1k: 10.0     # API price; web fetch has no per-call charge
+
+efforts: [low, medium, high, xhigh, max]
+
+models:
+  fable-5.1:
+    id: claude-fable-5-1
+    display_name: Claude Fable 5.1
+    context_window: 1000000
+    max_output_tokens: 128000
+    efforts: [low, medium, high, xhigh, max]
+    pricing_usd_per_mtok: {input: 10.00, cache_write_5m: 12.50, cache_write_1h: 20.00, cache_read: 0.25, output: 50.00}
+
+  opus-5.5:
+    id: claude-opus-5-5
+    display_name: Claude Opus 5.5
+    context_window: 1000000
+    max_output_tokens: 128000
+    efforts: [low, medium, high, xhigh, max]
+    pricing_usd_per_mtok: {input: 4.00, cache_write_5m: 5.00, cache_write_1h: 8.00, cache_read: 0.20, output: 20.00}
+
+  opus-5:
+    id: claude-opus-5
+    display_name: Claude Opus 5
+    context_window: 1000000
+    max_output_tokens: 128000
+    efforts: [low, medium, high, xhigh, max]
+    pricing_usd_per_mtok: {input: 5.00, cache_write_5m: 6.25, cache_write_1h: 10.00, cache_read: 0.50, output: 25.00}
+
+  fable-5:
+    id: claude-fable-5
+    display_name: Claude Fable 5
+    context_window: 1000000
+    max_output_tokens: 128000
+    efforts: [low, medium, high, xhigh, max]
+    pricing_usd_per_mtok: {input: 10.00, cache_write_5m: 12.50, cache_write_1h: 20.00, cache_read: 1.00, output: 50.00}
+
+  opus-4.8:
+    id: claude-opus-4-8
+    display_name: Claude Opus 4.8
+    context_window: 1000000
+    max_output_tokens: 128000
+    efforts: [low, medium, high, xhigh, max]
+    pricing_usd_per_mtok: {input: 5.00, cache_write_5m: 6.25, cache_write_1h: 10.00, cache_read: 0.50, output: 25.00}
+
+  sonnet-5:
+    id: claude-sonnet-5
+    display_name: Claude Sonnet 5
+    context_window: 1000000
+    max_output_tokens: 128000
+    efforts: [low, medium, high, xhigh, max]
+    pricing_usd_per_mtok: {input: 2.00, cache_write_5m: 2.50, cache_write_1h: 4.00, cache_read: 0.20, output: 10.00}
+
+  haiku-4.5:            # Claude Code uses it internally (e.g. to digest WebFetch pages)
+    id: claude-haiku-4-5
+    aliases: [claude-haiku-4-5-20251001]
+    display_name: Claude Haiku 4.5
+    context_window: 200000
+    max_output_tokens: 64000
+    efforts: []
+    pricing_usd_per_mtok: {input: 1.00, cache_write_5m: 1.25, cache_write_1h: 2.00, cache_read: 0.10, output: 5.00}

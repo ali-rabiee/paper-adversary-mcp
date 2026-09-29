@@ -1,0 +1,125 @@
+# Default pipeline configuration.
+#
+# Model names are aliases resolved through config/models.yaml, so no model ID is
+# hard-coded in the orchestration code. Per-run overrides (create_review_run's
+# `config_override`) are deep-merged over this file, then over the optional
+# user file named by $PAPER_ADVERSARY_CONFIG.
+#
+# effort: low | medium | high | xhigh | max   (passed to `claude --effort`)
+
+orchestrator:            # intake pass: metadata + claims ledger (seen only by synthesis and critic)
+  enabled: true
+  model: fable-5.1
+  effort: high
+  prompt: intake_v1
+  timeout_minutes: 30
+
+novelty:
+  model: opus-5.5
+  effort: high
+  agents: 4
+  prompt: novelty_v1
+  lenses: true           # give each agent a different primary focus (see prompts/lenses_v1.yaml)
+  tools: [web_search, web_fetch, literature]
+  paper_format: text
+  timeout_minutes: 75
+
+rigor:
+  model: fable-5.1
+  effort: max
+  agents: 3
+  prompt: rigor_v1
+  lenses: true
+  tools: []
+  paper_format: pdf      # PDF inputs: agents also get the original PDF (read-only, sandboxed)
+  timeout_minutes: 90
+
+fit:
+  model: opus-5.5
+  effort: high
+  agents: 3
+  prompt: fit_v1
+  lenses: true
+  tools: []
+  paper_format: text
+  timeout_minutes: 60
+
+judge:
+  model: fable-5.1
+  effort: max
+  agents: 3
+  prompt: judge_v1
+  lenses: false          # judges get identical instructions; independence comes from isolation
+  tools: []
+  paper_format: pdf
+  timeout_minutes: 90
+
+synthesis:
+  model: fable-5.1
+  effort: max
+  agents: 1
+  prompt: synthesis_v1
+  tools: []
+  paper_format: text
+  timeout_minutes: 90
+
+critic:
+  model: fable-5.1
+  effort: xhigh
+  agents: 1
+  prompt: critic_v1
+  tools: []
+  paper_format: text
+  timeout_minutes: 90
+
+rubric: default_v1       # prompts/rubrics/<name>.md, or pass rubric text/path per run
+lens_set: lenses_v1      # prompts/<lens_set>.yaml
+
+provider:
+  type: claude_code      # claude_code (your Claude plan, headless `claude -p`) | mock (offline testing)
+  claude_binary: null    # null = find `claude` on PATH, then ~/.local/bin/claude
+  allow_api_key: false   # never let a child process bill ANTHROPIC_API_KEY instead of your plan
+  safe_mode: true        # --safe-mode: no CLAUDE.md, skills, plugins, hooks or user MCP servers in agents
+  pdf_delivery: read_tool   # read_tool (PDF copied into the agent's sandbox, Read tool only)
+  preflight: probe       # probe | auth_only | off   (probe = tiny low-effort call per distinct model)
+  probe_cache_hours: 24
+  idle_timeout_minutes: 25  # kill an agent whose stream is silent this long, then retry
+  env_passthrough: []    # extra environment variables to hand to agent processes
+  extra_args: []         # extra `claude` CLI flags for every agent
+
+concurrency:
+  max_parallel_agents: 3 # plan-friendly; raise it if your plan tolerates more parallel sessions
+  stagger_seconds: 3
+
+retry:
+  max_attempts: 4
+  base_delay_seconds: 30
+  max_delay_seconds: 900
+  jitter: 0.25
+
+plan_limit:
+  policy: wait           # wait (sleep until the limit resets, then continue) | fail
+  max_wait_hours: 6
+  default_wait_minutes: 30   # when the reset time cannot be parsed
+
+search:
+  providers: [openalex, semantic_scholar, arxiv, crossref]
+  max_results: 10
+  cache_ttl_days: 14
+  refcheck: true         # verify every reference cited by novelty refuters
+  refcheck_max_refs: 60
+  web_search: true
+  web_fetch: true
+
+budget:
+  chars_per_token: 3.2   # conservative heuristic; replaced by a calibrated ratio once agents report usage
+  safety_margin_tokens: 12000
+  output_reserve_tokens: 64000
+  # Which sections stay inline when a paper must be split (sectioned mode).
+  # The remaining sections stay available to the agent through a read_paper_section tool.
+  section_priority:
+    default: [title, abstract, introduction, method, theory, experiments, results, limitations, conclusion, related_work, references, appendix, other]
+    intake: [title, abstract, introduction, method, theory, experiments, results, limitations, conclusion, related_work, appendix, other, references]
+    novelty: [title, abstract, introduction, related_work, references, method, conclusion, experiments, results, limitations, theory, appendix, other]
+    rigor: [title, abstract, method, theory, experiments, results, introduction, limitations, appendix, conclusion, related_work, other, references]
+    fit: [title, abstract, experiments, results, method, introduction, limitations, appendix, conclusion, theory, related_work, other, references]
