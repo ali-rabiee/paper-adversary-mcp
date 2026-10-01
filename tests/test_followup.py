@@ -8,7 +8,7 @@ import pytest
 import yaml
 
 from conftest import mock_override
-from paper_adversary import service
+from paper_adversary import followup, gates, service
 from paper_adversary.config import ConfigError, deep_merge, load_config
 from paper_adversary.isolation import IsolationGuard, IsolationViolation, position
 from paper_adversary.pipeline import Pipeline
@@ -48,14 +48,18 @@ def _seen(store, aid, role):
 def test_a_round_end_to_end(runs_dir, sample_paper):
     store = _create(sample_paper, items={"C1": ITEMS})
     result, _ = _run(store)
-    assert result["outcome"] == "complete" and "follow-up: converged" in result["message"], result
+    assert result["outcome"] == "complete", result
+    # no new items, but the mock's J2 rates every first objection FATAL: open issues, not ready
+    assert "follow-up: review_saturated_with_open_issues" in result["message"], result
     state = store.load_state()
     agents = state["agents"]
     for aid, role in (("A1", "adjudicator"), ("A2", "adjudicator"), ("S2", "revision"), ("C2", "recheck")):
         assert agents[aid]["status"] == "complete" and agents[aid]["round"] == 1, aid
         assert store.report_path(aid, role).is_file()
     rnd = state["followup"]["rounds"]["1"]
-    assert rnd["status"] == "complete" and rnd["outcome"] == "converged" and rnd["memo_before"] == "S1"
+    assert rnd["status"] == "complete" and rnd["outcome"] == followup.SATURATED and rnd["memo_before"] == "S1"
+    issues = read_json(store.dir / "followup/round-1/round.json")["open_issues"]
+    assert {x["id"] for x in issues["blocking"]["fatal"]} >= {"R1-O1", "F1-O1"} and not issues["blocking"].get("reraised")
     items = read_json(store.dir / "followup/round-1/items.json")["items"]
     assert [(i["id"], i["route"]) for i in items] == [("C1-I1", "adjudicate"), ("C1-I2", "revision"),
                                                      ("C1-I3", "noted"), ("C1-I4", "invalid")]
@@ -121,7 +125,7 @@ def test_new_items_start_another_round_up_to_the_cap(runs_dir, sample_paper):
     result, _ = _run(store)
     state = store.load_state()
     rounds = state["followup"]["rounds"]
-    assert rounds["1"]["outcome"] == "another_round" and rounds["2"]["outcome"] in ("converged",
+    assert rounds["1"]["outcome"] == "another_round" and rounds["2"]["outcome"] in (followup.SATURATED,
                                                                                    "max_rounds_reached")
     assert {a: state["agents"][a]["round"] for a in ("A3", "A4", "S3", "C3")} == {"A3": 2, "A4": 2, "S3": 2,
                                                                                  "C3": 2}
@@ -136,11 +140,69 @@ def test_new_items_start_another_round_up_to_the_cap(runs_dir, sample_paper):
     assert list(rounds) == ["1"] and rounds["1"]["outcome"] == "max_rounds_reached"
 
 
-def test_repeats_do_not_count_as_new(runs_dir, sample_paper):
-    store = _create(sample_paper, items={"C1": [item(1)], "C2": [item(1, repeats_item="C1-I1")]})
+def test_repeats_start_no_round_but_stay_open(runs_dir, sample_paper):
+    store = _create(sample_paper, extra={"judge": {"agents": 1}},  # J1 rates nothing FATAL
+                    items={"C1": [item(1)], "C2": [item(1, repeats_item="C1-I1")]})
     _run(store)
     result = read_json(store.dir / "followup/round-1/round.json")
-    assert result["outcome"] == "converged" and result["disputed_repeats"][0]["repeats"] == "C1-I1"
+    assert result["outcome"] == followup.SATURATED and result["disputed_repeats"][0]["repeats"] == "C1-I1"
+    dispute = result["open_issues"]["blocking"]["reraised"][0]
+    assert dispute["earlier_rulings"] == {"A1": "MAJOR_FIXABLE", "A2": "MAJOR_FIXABLE"}
+    assert dispute["earlier_disposition"] == "incorporated"
+    assert len(store.load_state()["followup"]["rounds"]) == 1  # no new round for a re-raised item
+    assert "re-raised by the re-check critic: C2-I1 (repeats C1-I1" in service.status_text(store.run_id)
+
+
+def test_ready_for_the_next_gate_when_nothing_serious_is_open(runs_dir, sample_paper):
+    store = _create(sample_paper, extra={"judge": {"agents": 1}}, items={"C1": [item(1)]})
+    result, _ = _run(store)
+    assert "follow-up: ready_for_next_gate" in result["message"], result
+    issues = read_json(store.dir / "followup/round-1/round.json")["open_issues"]
+    assert not issues["blocking"] and issues["major"]  # fixable issues are listed, they do not block
+    assert "ready for the next gate" in service.status_text(store.run_id)
+
+
+class _Files:
+    def __init__(self, root):
+        self.dir = root
+
+    def role_dir(self, role):
+        return self.dir / {"judge": "judges"}[role]
+
+
+def test_open_issues_rules(tmp_path):
+    from paper_adversary.util import atomic_write_json
+
+    store = _Files(tmp_path)
+    atomic_write_json(tmp_path / "judges/judgment_matrix.json", {"rows": [
+        {"id": "N1-O1", "title": "a", "verdicts": {"J1": {"severity": "FATAL"}, "J2": {"severity": "MAJOR_FIXABLE"}}},
+        {"id": "N1-O2", "title": "b", "verdicts": {"J1": {"severity": "FATAL"}}},
+        {"id": "R1-O1", "title": "c", "verdicts": {"J1": {"severity": "MAJOR_FIXABLE"}}}]})
+    atomic_write_json(tmp_path / "judges/evidence_gate.json", {"flagged_ids": ["N1-O2"]})
+    state = {"agents": {"A1": {"status": "complete"}, "A2": {"status": "complete"}},
+             "followup": {"rounds": {"1": {"adjudicators": ["A1", "A2"]}}}}
+
+    def round_with(updates):
+        atomic_write_json(tmp_path / "followup/round-1/followup_matrix.json", {
+            "rows": [{"id": "C1-I1", "title": "d", "verdicts": {"A1": {"severity": "MINOR"},
+                                                                "A2": {"severity": "MAJOR_FIXABLE"}}}],
+            "gate": {"flagged_ids": []}, "objection_updates": updates})
+        return followup.open_issues(store, state)
+
+    issues = round_with([{"adjudicator": "A1", "objection_id": "N1-O1", "severity": "MAJOR_FIXABLE"}])
+    assert [x["id"] for x in issues["blocking"]["fatal"]] == ["N1-O1"]  # one adjudicator cannot overturn it
+    assert [x["id"] for x in issues["blocking"]["unverified_fatal"]] == ["N1-O2"]
+    both = [{"adjudicator": a, "objection_id": "N1-O1", "severity": "MAJOR_FIXABLE"} for a in ("A1", "A2")]
+    issues = round_with(both)
+    assert "fatal" not in issues["blocking"] or not issues["blocking"]["fatal"]
+    assert {x["id"] for x in issues["major"]} == {"N1-O1", "R1-O1", "C1-I1"}
+    issues = round_with([{"adjudicator": "A2", "objection_id": "R1-O1", "severity": "FATAL"}])
+    assert {x["id"] for x in issues["blocking"]["fatal"]} == {"N1-O1", "R1-O1"}  # an adjudicator's FATAL counts too
+    atomic_write_json(tmp_path / "judges/evidence_gate.json", {"flagged_ids": []})
+    atomic_write_json(tmp_path / "judges/judgment_matrix.json", {"rows": [
+        {"id": "R1-O1", "title": "c", "verdicts": {"J1": {"severity": "MAJOR_FIXABLE"}}}]})
+    assert round_with([])["blocking"] == {}  # only MAJOR BUT FIXABLE left: ready
+    assert round_with([])["major"] and followup.open_issues(store, state, [{"id": "C2-I1"}])["blocking"]["reraised"]
 
 
 def test_an_interrupted_round_resumes(runs_dir, sample_paper):
@@ -162,7 +224,8 @@ def test_an_interrupted_round_resumes(runs_dir, sample_paper):
 def test_follow_up_needs_a_structured_critic_and_something_to_do(runs_dir, sample_paper):
     store = _create(sample_paper)  # the default mock critic raises one MINOR item
     result, _ = _run(store)
-    assert store.load_state()["followup"]["rounds"]["1"]["outcome"] == "nothing_to_follow_up"
+    rnd = store.load_state()["followup"]["rounds"]["1"]
+    assert rnd["outcome"] == followup.SATURATED and rnd["reason"] == "nothing_to_follow_up"  # J2's FATALs stand
     assert not any(a["role"] == "adjudicator" for a in store.load_state()["agents"].values())
     old = _create(sample_paper, extra={"critic": {"prompt": "critic_v1"}})
     result, _ = _run(old)
@@ -256,3 +319,28 @@ def test_a_released_revision_becomes_the_current_memo(runs_dir, sample_paper):
     state = store.load_state()
     assert state["followup"]["current_memo"] == "S2" and state["agents"]["S1"]["superseded_by"] == "S2"
     assert service.get_report(store.run_id, "memo").find("(S2)") > 0
+
+
+def test_an_adjudicator_that_skips_an_item_gets_a_supplement(runs_dir, sample_paper):
+    store = _create(sample_paper, items={"C1": ITEMS}, skip_item={"A1": "C1-I1"})
+    _run(store)
+    a1 = store.load_state()["agents"]["A1"]
+    assert a1["status"] == "complete" and any("C1-I1" in w for w in a1["gate"]["warnings"])
+    rulings = read_json(store.sidecar_path("A1", "adjudicator", ".json"))["data"]["rulings"]
+    assert any(r["item_ids"] == ["C1-I1"] and r.get("origin") == "supplement" for r in rulings)
+    prompt = next((store.dir / "logs/agents/A1").glob("attempt-1/supplement-1/user_prompt.md")).read_text()
+    assert "<critic_report" in prompt and "<refuter_reports" not in prompt and "<judge_reports" not in prompt
+    assert "CANARY_A2" not in prompt  # still blind to the other adjudicator
+
+
+def test_a_revised_memo_that_misfiles_a_threat_is_fixed(runs_dir, sample_paper):
+    novelty = item(5, "novelty_to_verify", candidate_references=[{"title": "Some Earlier Paper",
+                                                                  "arxiv_id": "2201.00001"}])
+    store = _create(sample_paper, items={"C1": [novelty]}, misfile={"S2": True})
+    _run(store)
+    state = store.load_state()
+    assert state["agents"]["S2"]["status"] == "complete" and state["followup"]["current_memo"] == "S2"
+    fix = read_json(store.gate_path("S2", "revision"))["placement_fix"]
+    assert fix["outcome"] == "accepted" and "C1-I5" in fix["flagged"]
+    _, body = read_report(store.report_path("S2", "revision"))
+    assert "C1-I5" not in gates.lead_ids(gates.section_text(body, 5)) and "item_dispositions" in body

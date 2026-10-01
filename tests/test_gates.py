@@ -94,13 +94,45 @@ def test_judgment_headings_take_the_last_parenthesised_ids():
 
 def test_coverage():
     expected = {"N1-O1", "N1-O2", "R1-O1", "R1-O2"}
-    js = [{"objection_ids": ["N1-O1", "R1-O1"]}, {"objection_ids": ["N1-O2"]}, {"objection_ids": ["N1-O1", "X1-O9"]}]
+    js = [{"objection_ids": ["N1-O1", "R1-O1"], "severity": "MAJOR"}, {"objection_ids": ["N1-O2"], "severity": "MINOR"},
+          {"objection_ids": ["N1-O1", "X1-O9"], "severity": "MAJOR BUT FIXABLE"}]
     check = gates.check_coverage(js, expected, 0.5)
     assert check.result == gates.WARN
     assert check.details["missing"] == ["R1-O2"] and check.details["unknown"] == ["X1-O9"]
-    assert check.details["duplicates"] == {"N1-O1": 2}
+    assert check.details["repeated"] == ["N1-O1"] and not check.details["conflicts"]
+    assert gates.check_coverage(js, expected, 1.0).result == gates.BLOCK  # the default: every objection
     assert gates.check_coverage([{"objection_ids": ["N1-O1"]}], expected, 0.5).result == gates.BLOCK
-    assert gates.check_coverage([{"objection_ids": ["N1-O1", "N1-O2"]}], expected, 0.5).result == gates.WARN
+    two = js[:2] + [{"objection_ids": ["N1-O1"], "severity": "FATAL"}, {"objection_ids": ["R1-O2"], "severity": "MINOR"}]
+    check = gates.check_coverage(two, expected, 1.0)  # complete, but one objection has two different verdicts
+    assert check.result == gates.BLOCK and check.details["conflicts"] == {"N1-O1": ["MAJOR_FIXABLE", "FATAL"]}
+    merged = gates.drop_ids(js, "objection_ids", {"N1-O1"}, keep_first=True)
+    assert [e["objection_ids"] for e in merged] == [["N1-O1", "R1-O1"], ["N1-O2"], ["X1-O9"]]
+    assert [e["objection_ids"] for e in gates.drop_ids(js, "objection_ids", {"N1-O1", "N1-O2"})] == [["R1-O1"],
+                                                                                                      ["X1-O9"]]
+    single = [{"objection_id": "n1-o1", "severity": "MINOR"}, {"objection_ids": ["N1-O1"], "severity": "MINOR"}]
+    status = gates.coverage_status(single, "objection_ids", {"N1-O1"})
+    assert status["repeated"] == ["N1-O1"] and not status["missing"]  # a single objection_id counts too
+    assert gates.drop_ids(single, "objection_ids", {"N1-O1"}, keep_first=True) == [
+        {"severity": "MINOR", "objection_ids": ["N1-O1"]}]
+
+
+def test_placement_reads_entry_leads_and_splices_two_sections():
+    required = [(5, "Criticisms that survived judging"), (6, "Unverified threats — check before acting"),
+                (7, "Criticisms that were rejected")]
+    memo = ("## 5. Criticisms that survived judging\n| Objection(s) | J1 | View |\n|---|---|---|\n"
+            "| N1-O1, R1-O1: anticipated | FATAL | Shown; unlike N1-O2. |\n- **R1-O3** — single seed\n"
+            "Prose that mentions N1-O2 in passing.\n\n## 6. Unverified threats — check before acting\n"
+            "**N1-O2: interval guidance.**\n- Stakes: FATAL.\n\n## 7. Criticisms that were rejected\nNone.\n")
+    assert gates.check_unverified_placement(memo, required, ["N1-O2"], True).result == gates.PASS
+    check = gates.check_unverified_placement(memo, required, ["R1-O3", "N9-O1"], True)
+    assert check.result == gates.BLOCK and check.details == {"misplaced": ["R1-O3"], "absent": ["N9-O1", "R1-O3"]}
+    fix = ("## 5. Criticisms that survived judging\n- **N1-O1** — kept\n\n"
+           "## 6. Unverified threats — check before acting\n- **R1-O3** — moved\n")
+    fixed = gates.splice_sections(memo, fix, 5, 6)
+    assert fixed.endswith("## 7. Criticisms that were rejected\nNone.\n") and "- **R1-O3** — moved" in fixed
+    without_six = memo.replace(memo[memo.index("## 6."):memo.index("## 7.")], "")
+    assert "## 6." in gates.splice_sections(without_six, fix, 5, 6)  # a missing section 6 is inserted
+    assert gates.splice_sections(memo, "## 5. Criticisms that survived judging\nonly five\n", 5, 6) is None
 
 
 def test_required_sections_come_from_the_prompt_version_used():

@@ -52,15 +52,19 @@ class MockProvider:
     served_model    {aid: model id}
     drop_sections   {aid: [section numbers]}       synthesis/critic sections left out
     coverage        {aid: fraction}                share of objections a judge classifies
+    conflict        {aid: objection ID}            a judge classifies this ID a second time, MAJOR BUT FIXABLE
     repair          {aid: valid|invent_objection|invent_reference|change_title|fail:<kind>}
     decisive        {aid: {category, severity, basis, prior: {title, arxiv_id, doi}, prior_passage,
                            submission_passage}}    makes a novelty refuter's O1 a decisive prior-work objection
     verdict         {aid or "default": verdict}    what verifiers answer (default anticipates_partially)
     misplace        {aid: True}                    a memo lists unverified threats as surviving criticisms
+    misfile         {aid: True}                    a revised memo also leads a section-5 entry with them
     items           {aid: [item, ...]}             a critic's (critic_v2) or re-check's items (default: one MINOR)
     ruling          {aid or "default": severity}   what adjudicators rule (default MAJOR_FIXABLE)
     skip_item       {aid: item id}                 an adjudicator or revision leaves this item out
     references      {aid: [ref, ...]}              a novelty refuter's references (default: one well-known paper)
+    supplement      {aid: valid|skip_one|invalid|extra|fail:<kind>}   how a coverage supplement answers
+    placement_fix   {aid: valid|unchanged|renamed|invent|fail:<kind>} how a memo placement fix answers
     """
 
     name = "mock"
@@ -116,6 +120,10 @@ class MockProvider:
         if req.role == "repair":
             self.repair_calls += 1
             text = self._repair(req, attempt)
+        elif req.role == "supplement":
+            text = self._supplement(req, attempt)
+        elif req.role == "placement_fix":
+            text = self._placement_fix(req, attempt)
         else:
             seen = sorted({f"CANARY_{m}" for m in CANARY.findall(req.system_prompt + req.user_text)})
             json_mode = self._opt("json", aid, attempt) or ("omit" if aid in (self.options.get("omit_json") or [])
@@ -123,7 +131,8 @@ class MockProvider:
             text = _render(req, seen, json_mode, self._opt("headings", aid, attempt, True),
                            self._opt("coverage", aid, attempt), self._opt("decisive", aid, attempt),
                            self._opt("verdict", aid, attempt) or (self.options.get("verdict") or {}).get("default"),
-                           bool(self._opt("misplace", aid, attempt)), self._opt("references", aid, attempt))
+                           bool(self._opt("misplace", aid, attempt)), self._opt("references", aid, attempt),
+                           self._opt("conflict", aid, attempt))
             if req.role in ("critic", "recheck") and '"items": [' in req.system_prompt and json_mode != "omit":
                 text += "\n" + _block({"summary": "mock", "items": self._opt("items", aid, attempt, DEFAULT_ITEMS),
                                         "checks_without_findings": []}, json_mode)
@@ -133,6 +142,7 @@ class MockProvider:
                                     self._opt("skip_item", aid, attempt))
             elif req.role == "revision":
                 text = _revision(req, head_of(text), bool(self._opt("misplace", aid, attempt)),
+                                 bool(self._opt("misfile", aid, attempt)),
                                  self._opt("skip_item", aid, attempt))
             if self.options.get("quote_inputs"):
                 text += _quotes(req.user_text)
@@ -213,6 +223,56 @@ class MockProvider:
         return "```json\n" + json.dumps(data, indent=2) + "\n```"
 
 
+    def _supplement(self, req: AgentRequest, attempt: int) -> str:
+        """Act as a judge's or adjudicator's coverage supplement: rule on exactly the IDs it was asked about."""
+        base = req.agent_id.removesuffix("-supplement")
+        mode = str(self._opt("supplement", base, attempt) or "valid")
+        if mode.startswith("fail:"):
+            raise ProviderError(ErrorKind(mode.split(":", 1)[1]), f"injected supplement failure ({mode})")
+        asked = re.findall(r"^- ([A-Z]{1,2}\d+-[OI]\d+): (?:not classified|you gave it)", req.user_text, re.M)
+        if mode == "skip_one":
+            asked = asked[1:]
+        if mode == "extra":
+            asked = asked + ["Z9-O9" if not base.startswith("A") else "C9-I9"]
+        shown = sorted(set(re.findall(r'<report agent_id="([NRF]\d+)"', req.user_text)))
+        if base.startswith("A"):
+            entries = [{"item_ids": [i], "title": f"ruling on {i}", "severity": "MINOR", "confidence": "medium",
+                        "is_new": "yes", "already_covered_by": [], "objection_updates": [],
+                        "evidence_status": "not_applicable", "supporting_evidence": "mock", "rationale": "mock",
+                        "resolvable_with_more_evidence": "yes", "what_would_resolve": "mock"} for i in asked]
+            data: dict = {"rulings": entries}
+        else:
+            entries = [{"objection_ids": [i], "title": f"{i} (supplement)", "severity": "MINOR",
+                        "confidence": "medium", "refuter_sources": [i.split("-")[0]], "supporting_evidence": "mock",
+                        "resolvable_with_more_evidence": "yes", "what_would_resolve": "mock"} for i in asked]
+            data = {"judgments": entries, "refuter_disagreements": []}
+        if mode == "invalid":
+            data = {"judgments": [{"objection_ids": asked[:1], "severity": "SEVERE"}]} if not base.startswith("A") \
+                else {"rulings": [{"item_ids": asked[:1], "severity": "SEVERE"}]}
+        heads = "\n".join(f"### MINOR: ruling ({i})\nMock supplement ruling.\n" for i in asked)
+        return f"Supplement saw reports of: {', '.join(shown) or 'none'}\n\n{heads}\n" + _block(data)
+
+    def _placement_fix(self, req: AgentRequest, attempt: int) -> str:
+        """Act as a memo's placement fix: file the named IDs under the unverified-threats section."""
+        base = req.agent_id.removesuffix("-placement_fix")
+        mode = str(self._opt("placement_fix", base, attempt) or "valid")
+        if mode.startswith("fail:"):
+            raise ProviderError(ErrorKind(mode.split(":", 1)[1]), f"injected placement-fix failure ({mode})")
+        heads = re.findall(r"`## (\d+)\. ([^`]+)`", req.system_prompt)
+        m = re.search(r"may not lead an entry of section \d+: ([^\n]+)", req.user_text)
+        flagged = [x.strip() for x in m.group(1).split(",")] if m else []
+        (five, five_title), (six, six_title) = heads[:2]
+        if mode == "renamed":
+            six_title = "Threats"
+        survived = "Mock (fixed)."
+        if mode == "unchanged":
+            survived = "\n".join(f"- **{i}** — survived judging." for i in flagged)
+        if mode == "invent":
+            survived = "- **Z9-O9** — an objection the memo never cited."
+        unverified = "\n".join(f"- **{i}** — unverified; check the full text first." for i in flagged)
+        return f"## {five}. {five_title}\n\n{survived}\n\n## {six}. {six_title}\n\n{unverified}\n"
+
+
 def _block(data: dict, mode: str | None = None) -> str:
     raw = json.dumps(data, indent=2)
     if mode == "malformed":
@@ -228,7 +288,7 @@ def _block(data: dict, mode: str | None = None) -> str:
 
 def _render(req: AgentRequest, seen: list[str], json_mode: str | None, headings: bool,
             coverage: float | None, decisive: dict | None = None, verdict: str | None = None,
-            misplace: bool = False, references: list | None = None) -> str:
+            misplace: bool = False, references: list | None = None, conflict: str | None = None) -> str:
     aid = req.agent_id
     head = f"# Mock {req.role} report ({aid})\n\nCANARY_{aid}\n\nInputs seen: {', '.join(seen) or 'none'}\n"
     if req.role == "verifier":
@@ -286,6 +346,11 @@ def _render(req: AgentRequest, seen: list[str], json_mode: str | None, headings:
                                   "resolvable_with_more_evidence": "partially", "what_would_resolve": "mock"})
         if coverage is not None:
             judgments = judgments[: max(0, round(len(judgments) * coverage))]
+        if conflict:
+            judgments.append({"objection_ids": [conflict], "title": f"{conflict} again", "severity": "MAJOR_FIXABLE",
+                              "confidence": "low", "refuter_sources": [conflict.split("-")[0]],
+                              "supporting_evidence": "mock", "resolvable_with_more_evidence": "yes",
+                              "what_would_resolve": "mock"})
         lines = []
         for j in judgments:
             label = SEVERITY_LABEL[j["severity"]]
@@ -297,15 +362,14 @@ def _render(req: AgentRequest, seen: list[str], json_mode: str | None, headings:
     if req.role in ("synthesis", "critic", "recheck", "revision", "adjudicator"):
         sections = _prompt_sections(req.system_prompt) or list(enumerate(
             SYNTHESIS_SECTIONS if req.role == "synthesis" else CRITIC_SECTIONS, 1))
-        flagged = re.findall(r"^- J\d+ \S+(?: BUT FIXABLE)? on ([A-Z0-9, -]+?) \(", req.user_text, re.M)
-        ids = sorted({x.strip() for group in flagged for x in group.split(",")})
+        ids = _gated_ids(req.user_text)
         out = []
         for n, title in sections:
             body = "Mock."
             if title.lower().startswith("unverified threats") and ids and not misplace:
-                body = "Unverified: " + ", ".join(ids) + "."
+                body = f"- **{', '.join(ids)}** — unverified; check the full text first."
             if title.lower().startswith("criticisms that survived") and ids and misplace:
-                body = "Survived: " + ", ".join(ids) + "."
+                body = f"- **{', '.join(ids)}** — survived judging."
             out.append(f"## {n}. {title}\n\n{body}\n")
         return head + "\n" + "\n".join(out)
     if req.role == "intake":
@@ -334,9 +398,16 @@ def _adjudicator(req: AgentRequest, head: str, severity: str, skip: str | None) 
     return head + "\n## Rulings\n\n" + body + _block({"overall": "mock", "rulings": rulings})
 
 
-def _revision(req: AgentRequest, head: str, misplace: bool, skip: str | None) -> str:
+def _gated_ids(user_text: str) -> list[str]:
+    """IDs the evidence gates in an agent's prompt list as not shown (base and follow-up gates)."""
+    groups = re.findall(r"^- [JA]\d+ \S+(?: BUT FIXABLE)? on ([A-Z0-9, -]+?)(?: \(|:)", user_text, re.M)
+    return sorted({x.strip() for group in groups for x in group.split(",") if x.strip()})
+
+
+def _revision(req: AgentRequest, head: str, misplace: bool, misfile: bool, skip: str | None) -> str:
     gate = re.search(r"Follow-up gate: not shown: ([^\n]+)", req.user_text)
-    flagged = {x.strip() for x in gate.group(1).split(",")} if gate else set()
+    flagged = {x.strip() for x in gate.group(1).split(",") if x.strip() != "none"} if gate else set()
+    shown_in_six = sorted(set(_gated_ids(req.user_text)) | flagged)
     disp = {"adjudicate": "incorporated", "revision": "incorporated", "noted": "noted", "invalid": "invalid"}
     items = []
     for item_id, route in _triage(req.user_text):
@@ -345,9 +416,13 @@ def _revision(req: AgentRequest, head: str, misplace: bool, skip: str | None) ->
         d = "unverified_threat" if item_id in flagged and not misplace else disp.get(route, "incorporated")
         items.append({"item_id": item_id, "disposition": d, "memo_sections": [12], "note": "mock"})
     sections = _prompt_sections(req.system_prompt)
-    memo = "\n".join(f"## {n}. {t}\n\n" + ("Unverified: " + ", ".join(sorted(flagged)) + "." if
-                                              t.lower().startswith("unverified") and flagged and not misplace
-                                              else "Mock.") + "\n" for n, t in sections)
+    def body(t: str) -> str:
+        if t.lower().startswith("unverified") and shown_in_six and not misplace:
+            return f"- **{', '.join(shown_in_six)}** — unverified; check first."
+        if t.lower().startswith("criticisms that survived") and shown_in_six and misfile:
+            return f"- **{', '.join(shown_in_six)}** — survived judging."
+        return "Mock."
+    memo = "\n".join(f"## {n}. {t}\n\n{body(t)}\n" for n, t in sections)
     return head + "\n" + memo + "\n" + _block({"item_dispositions": items, "objection_changes": [],
                                                 "remaining_risk": "medium"})
 

@@ -148,24 +148,55 @@ def test_truncated_memo_is_quarantined_and_blocks_the_critic(runs_dir, sample_pa
 
 
 def test_memo_section_rules(runs_dir, sample_paper):
-    store = _create(sample_paper, drop_sections={"S1": [6]})
+    store = _create(sample_paper, drop_sections={"S1": [8]})
     _run(store)
     s1 = _agents(store)["S1"]
-    assert s1["status"] == "complete" and any("missing sections 6" in w for w in s1["gate"]["warnings"])
-    store = _create(sample_paper, drop_sections={"S1": [13]})  # synthesis_v2 ends with section 13
+    assert s1["status"] == "complete" and any("missing sections 8" in w for w in s1["gate"]["warnings"])
+    store = _create(sample_paper, drop_sections={"S1": [13]})  # synthesis_v3 ends with section 13
     _run(store)
     assert _agents(store)["S1"]["status"] == "quarantined"
 
 
-def test_substitution_and_low_coverage_quarantine(runs_dir, sample_paper):
-    store = _create(sample_paper, served_model={"F1": "claude-haiku-4-5"}, coverage={"J1": 0.2})
+def test_substitution_quarantines_and_coverage_gaps_get_a_supplement(runs_dir, sample_paper):
+    store = _create(sample_paper, served_model={"F1": "claude-haiku-4-5"}, coverage={"J1": 0.9})
     _run(store, allow_incomplete=True)
     agents = _agents(store)
     assert agents["F1"]["status"] == "quarantined" and agents["F1"]["gate"]["classes"] == ["integrity"]
     assert agents["F1"].get("auto_reruns") in (None, 0)  # only isolation failures rerun automatically
-    assert agents["J1"]["status"] == "quarantined" and "classified only" in agents["J1"]["detail"]
-    assert agents["J3"]["status"] == "complete"  # 50% coverage passes with warnings
-    assert any("not classified" in w for w in agents["J3"]["gate"]["warnings"])
+    j1 = agents["J1"]
+    assert j1["status"] == "complete" and any("coverage supplement" in w for w in j1["gate"]["warnings"])
+    gate = read_json(store.gate_path("J1", "judge"))
+    asked = gate["supplement"]["ids"]
+    assert gate["supplement"]["outcome"] == "accepted" and asked == ["R3-O1", "R3-O2"]  # the last 10% it skipped
+    sup_log = next((store.dir / "logs/agents/J1").glob("attempt-1/supplement-1/user_prompt.md")).read_text()
+    assert re.findall(r'<report agent_id="([NRF]\d+)"', sup_log) == ["R3"]  # only the report that raised them
+    judgments = read_json(store.sidecar_path("J1", "judge", ".json"))["data"]["judgments"]
+    assert {i for j in judgments for i in j["objection_ids"]} >= set(asked)
+    _, body = read_report(store.report_path("J1", "judge"))
+    assert "Coverage supplement (requested by the orchestrator)" in body
+    assert "R3-O2" in service.get_report(store.run_id, "matrix") and "not classified by J1" not in \
+        service.get_report(store.run_id, "matrix")
+    usage = read_jsonl(store.dir / "logs" / "usage.jsonl")
+    assert any(u["stage"] == "supplement" and u["agent_id"] == "J1" for u in usage)
+
+
+def test_a_supplement_that_leaves_gaps_quarantines(runs_dir, sample_paper):
+    store = _create(sample_paper, coverage={"J1": 0.9}, supplement={"J1": "skip_one", "J3": "fail:invalid_request"})
+    _run(store, ["intake", "novelty", "rigor", "fit", "judge"])
+    agents = _agents(store)
+    assert agents["J1"]["status"] == "quarantined" and "not classified (R3-O1)" in agents["J1"]["detail"]
+    assert agents["J3"]["status"] == "quarantined"  # its supplement call was refused: the gaps stay
+    assert read_json(store.gate_path("J3", "judge"))["supplement"]["outcome"] == "failed"
+
+
+def test_two_verdicts_for_one_objection_are_resolved(runs_dir, sample_paper):
+    store = _create(sample_paper, conflict={"J2": "N1-O1"})
+    _run(store, ["intake", "novelty", "rigor", "fit", "judge"])
+    gate = read_json(store.gate_path("J2", "judge"))
+    assert gate["supplement"]["conflicts"] == {"N1-O1": ["FATAL", "MAJOR_FIXABLE"]}
+    judgments = read_json(store.sidecar_path("J2", "judge", ".json"))["data"]["judgments"]
+    verdicts = [j["severity"] for j in judgments if "N1-O1" in j["objection_ids"]]
+    assert verdicts == ["MINOR"] and _agents(store)["J2"]["status"] == "complete"
 
 
 def test_interrupted_gate_resumes_without_rerunning_the_agent(runs_dir, sample_paper):
@@ -245,3 +276,22 @@ def test_crash_windows_inside_the_gate(runs_dir, sample_paper):
     assert agents["F1"]["status"] == "complete" and pipeline.provider.attempts.get("F1") is None
     assert agents["F2"]["status"] == "complete" and pipeline.provider.attempts.get("F2") == 1
     assert agents["F1"]["attempts"] == attempts["F1"]
+
+
+def test_an_accepted_supplement_is_reused_after_a_crash(runs_dir, sample_paper):
+    store = _create(sample_paper, coverage={"J1": 0.9})
+    _, pipeline = _run(store, ["intake", "novelty", "rigor", "fit", "judge"])
+    assert pipeline.provider.attempts.get("J1-supplement") == 1
+    # a crash right after the supplement was accepted: the report lacks it and the gate is undecided
+    archived = sorted((store.dir / "archive").rglob("J1.md"))[0]
+    store.report_path("J1", "judge").write_text(archived.read_text())
+    gate = read_json(store.gate_path("J1", "judge"))
+    gate.update(verdict="pending", decision=None)
+    store.gate_path("J1", "judge").write_text(__import__("json").dumps(gate))
+    store.update_state(lambda st: st["agents"]["J1"].update(status="gating"))
+    result, pipeline = _run(store, ["judge"])
+    assert result["outcome"] == "complete", result
+    assert pipeline.provider.attempts.get("J1-supplement") is None  # not paid for twice
+    _, body = read_report(store.report_path("J1", "judge"))
+    assert body.count("Coverage supplement (requested by the orchestrator)") == 1
+    assert _agents(store)["J1"]["status"] == "complete"

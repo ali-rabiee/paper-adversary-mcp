@@ -119,12 +119,14 @@ The same operations work from a terminal:
 | fit | opus-5.5 | high | 3 | fit_v1 |
 | verifier (blind) | opus-5.5 | high | ≤4 per batch, ≤8 per run | verifier_v1 |
 | judge | fable-5.1 | max | 3 | judge_v2 |
-| synthesis | fable-5.1 | max | 1 | synthesis_v2 |
+| synthesis | fable-5.1 | max | 1 | synthesis_v3 |
 | critic | fable-5.1 | xhigh | 1 | critic_v2 |
 | follow-up: adjudicator | fable-5.1 | max | 2 per round | adjudicator_v1 |
-| follow-up: revised memo | fable-5.1 | max | 1 per round | synthesis_revision_v1 |
+| follow-up: revised memo | fable-5.1 | max | 1 per round | synthesis_revision_v2 |
 | follow-up: re-check critic | fable-5.1 | xhigh | 1 per round | critic_recheck_v1 |
 | format repair (rare) | opus-5.5 | low | as needed | repair_v1 |
+| coverage supplement (rare) | the judge's or adjudicator's own | its own | as needed | coverage_supplement_v1 |
+| memo placement fix (rare) | the memo's own | its own | as needed | placement_fix_v1 |
 
 Override per run with `config_override` (an object, YAML text or a file path), e.g. `{"novelty": {"agents": 2}, "concurrency": {"max_parallel_agents": 5}}`. Set `$PAPER_ADVERSARY_CONFIG` for your own standing defaults. Unknown keys, unsupported efforts and unknown aliases are rejected before anything runs.
 
@@ -139,7 +141,7 @@ Flags that would widen an agent's access (`--add-dir`, `--permission-mode`, `--s
 
 Validation against what your plan actually serves happens before each run: the Claude Code login is checked for free, and a run on an API-key login is refused. Then a preflight probe sends one tiny low-effort request per distinct model and tool setup, cached for 24 h. It uses the same tools and MCP server as the real agents, so a broken tool setup stops the run before any real agent is spent. The probe also fails if another model answers or if Claude Code's output lacks the events the isolation audit needs.
 
-Main knobs: `concurrency.max_parallel_agents` (default 3, plan-friendly), `retry.*`, `plan_limit.policy` (`wait` sleeps until a usage limit resets, then continues; `fail` stops), `search.providers`, `search.fulltext.*`, `evidence.require_independent_check`, `followup.*`, `gates.*`, `lens_set`, `rubric`.
+Main knobs: `concurrency.max_parallel_agents` (default 3, plan-friendly), `retry.*`, `plan_limit.policy` (`wait` sleeps until a usage limit resets, then continues; `fail` stops), `search.providers`, `search.fulltext.*`, `evidence.require_independent_check`, `followup.*`, `gates.*` (including `gates.coverage_supplement` and `gates.placement_fix`), `lens_set`, `rubric`.
 
 ## Completion gates and quarantine
 
@@ -152,9 +154,12 @@ Every agent's output is saved first, then checked (`gates.py`). Only a passing g
 | Another model answered than configured | quarantine |
 | Report cut at the output-token limit | quarantine, unless its final JSON block is intact |
 | Structured block missing or invalid | free fixes first: strict parse, lenient parse, rebuild from the report's own headings (rigor, fit, judges). Intake and novelty reports get a format-repair call instead, validated so it can transcribe but never add content. Otherwise quarantine. The data's source is recorded. |
-| Judge classifies under half the objections | quarantine (gaps above that are warnings; judges also get an index of every objection ID) |
+| A judge or adjudicator leaves objections (items) unclassified, or gives one two different severities | one targeted supplement call on its own model and effort, ruling on exactly those and seeing only the reports that raised them; its rulings are merged and its reasoning appended to the report. Still incomplete → quarantine. Repeats with one severity are merged for free; judges also get an index of every objection ID |
 | Memo's last section missing | quarantine (a gap in the middle is a warning) |
+| A memo lists an unverified prior-work verdict under "Criticisms that survived judging", or leaves it out of "Unverified threats" | one targeted call on the memo's own model rewrites only those two sections; the result is spliced in and checked again; still wrong → quarantine. Only the IDs an entry starts with count, so a passing mention does not trigger it |
 | Revised memo: an item without a disposition, or an unverified prior-work item not filed as an unverified threat | quarantine |
+
+Targeted calls (a supplement or a placement fix) are made only for an output that no other check blocks, at most once per output, and a resume never pays for one twice. Each is recorded in the gate sidecar, and the edited report keeps its previous version in the archive.
 
 A quarantined output stays on disk but no later stage reads it: downstream prompts only see a label such as `R2 (quarantined: isolation audit failed)`, the matrix lists it as excluded, and the isolation guard forbids its content for every role. Later stages wait for it as for a failure (or proceed with `allow_incomplete`). Rerun it, or release it with a recorded reason: `release_quarantine` for quality reasons, the terminal (`paper-adversary release`) for isolation reasons, so a prompt-injected paper cannot release a contamination. `get_report(run_id, "gates", agent_id)` shows every check.
 
@@ -171,7 +176,7 @@ Bibliographic reference checks (does a cited paper exist?) are not enough: a ref
   - its submission quote lies outside the passage it was shown;
   - its prior quote is shorter than 8 words or comes from the reference list.
 - **Reruns.** Verdicts are tied to an objection's content, not its ID. When a refuter is rerun, its changed decisive objections are verified again (batch `refuters2`, …) before judges run.
-- **Evidence gate** (`evidence_gate.py`). Judges keep the four severities (`judge_v2` adds an evidence-status field). A FATAL or MAJOR BUT FIXABLE verdict on prior work counts as shown only when a blind verifier found anticipation (fully for FATAL, at least partially for MAJOR) with verified quotes. Otherwise it is labelled (UNVERIFIED with the reason, DISPUTED, UNCLEAR, SCOPE, REFERENCE NOT FOUND, REFERENCE MISMATCH, INVALID), never downgraded. The independent check is required while the verifier is enabled; with it turned off in your standing config, accepted refuter quotes suffice. The memo (`synthesis_v2`) lists labelled verdicts under "6. Unverified threats — check before acting", not "Criticisms that survived judging". A deterministic check warns if it doesn't. `get_report(run_id, "evidence_gate")`.
+- **Evidence gate** (`evidence_gate.py`). Judges keep the four severities (`judge_v2` adds an evidence-status field). A FATAL or MAJOR BUT FIXABLE verdict on prior work counts as shown only when a blind verifier found anticipation (fully for FATAL, at least partially for MAJOR) with verified quotes. Otherwise it is labelled (UNVERIFIED with the reason, DISPUTED, UNCLEAR, SCOPE, REFERENCE NOT FOUND, REFERENCE MISMATCH, INVALID), never downgraded. The independent check is required while the verifier is enabled; with it turned off in your standing config, accepted refuter quotes suffice. The memo (`synthesis_v3`) lists labelled verdicts under "6. Unverified threats — check before acting", not "Criticisms that survived judging", and starts every entry of those two sections with its IDs. A memo that misfiles one is sent back for those two sections (see the gates table). `get_report(run_id, "evidence_gate")`.
 - **Closing a gap.** If a paper was unavailable, give the server its PDF with `add_prior_fulltext`, then `run_verification(run_id, from_gate=true)`. The gate is recomputed without rerunning the judges. The file must be identified by arXiv ID or DOI, its title must match the cited paper, and it must not be the submission. It never replaces a downloaded text, and it is stored in this run's `prior/` only, never in the machine-wide cache.
 
 ## Full-text sources and politeness
@@ -191,9 +196,16 @@ Download URLs come only from API metadata, never from an agent. Redirects are fo
 2. **Verification**: items naming suspected prior work go to blind verifiers. They see only the submission's passage and the prior paper, never the critic's prose. Identical checks reuse earlier verdicts.
 3. **Adjudication**: two adjudicators, blind to each other, rule on every routed item with the judges' four severities and may re-rate base objections. A follow-up matrix flags contested items and rubber-stamping, and the evidence gate applies to prior-work items.
 4. **Revised memo** `S<r+1>`: a full memo with a closing "What changed after the completeness critique" table. Every item gets a disposition (incorporated, rejected, needs evidence, unverified threat, noted, invalid). It becomes the current memo; earlier memos stay in place, recorded as superseded.
-5. **Re-check critic** `C<r+1>`: a fresh critic on the revised memo. If it finds no new item at `min_severity` or above (repeats don't count), the review has converged. Otherwise the next round starts automatically, up to `max_rounds` (default 2).
+5. **Re-check critic** `C<r+1>`: a fresh critic on the revised memo. New items at `min_severity` or above start the next round automatically, up to `max_rounds` (default 2). Items it re-raises never start a round, since the adjudicators already ruled on them, but they stay open.
 
 `run_full_review` starts round 1 by itself when the critic raises an item at `min_severity` or above (`followup.auto_start`).
+
+**How a review ends.** A review that stops without new items is labelled `ready_for_next_gate` only when nothing serious is open. Otherwise it is `review_saturated_with_open_issues`, and the status lists the open issues. These block `ready`:
+- a FATAL verdict from a judge or adjudicator that the adjudicators did not overturn (overturning takes every adjudicator of the latest round that re-rated it);
+- an unverified FATAL prior-work threat;
+- an item the re-check critic re-raised.
+
+Open MAJOR BUT FIXABLE issues are listed but don't block. A review cut off at the round cap with new items is `max_rounds_reached`. The same label applies when the critic raises nothing to follow up. Each round's `round.json` records the open issues with the earlier rulings and dispositions of re-raised items.
 
 **Reruns and restarts.**
 - `run_followup(rerun_agents=[...])` reruns agents of the current round. The round reopens, and its finished agents are not rerun.
@@ -255,7 +267,7 @@ Gate verdicts are in `*.gate.json`.
 
 ## Prompts and experiments
 
-Prompts live in `prompts/` as `<role>_v<N>.md` (front matter + template). Lenses are in `lenses_v1.yaml` and rubrics in `rubrics/`. Versions are never edited in place: a change is a new file (as `novelty_v2`, `judge_v2`, `synthesis_v2` and `critic_v2` are), selected in the config or per run, e.g. `config_override={"novelty": {"prompt": "novelty_v3"}}`. Each report records the prompt version and the file's hash, so in-place edits are detectable too. A prompt whose front matter says `structured_output: true` must end its output with a fenced JSON block.
+Prompts live in `prompts/` as `<role>_v<N>.md` (front matter + template). Lenses are in `lenses_v1.yaml` and rubrics in `rubrics/`. Versions are never edited in place: a change is a new file (as `novelty_v2`, `judge_v2`, `synthesis_v3`, `synthesis_revision_v2` and `critic_v2` are), selected in the config or per run, e.g. `config_override={"novelty": {"prompt": "novelty_v3"}}`. Each report records the prompt version and the file's hash, so in-place edits are detectable too. A prompt whose front matter says `structured_output: true` must end its output with a fenced JSON block.
 
 ## Long papers
 
@@ -273,7 +285,7 @@ Optional: `S2_API_KEY` for a higher Semantic Scholar rate limit; `PAPER_ADVERSAR
 
 `get_run_status` also shows how much of your plan's 5-hour and 7-day windows is used, and whether paid overage is on, as Claude Code last reported. When a plan limit hits, the worker waits until the reset time Claude Code reports.
 
-`get_run_cost` reports input, cache-write, cache-read and output tokens, web searches and agent time per phase: verifiers, format repairs and each follow-up round are listed separately. It shows two cost figures: the API-equivalent cost Claude Code reports, and an estimate from `config/models.yaml` prices. On a plan neither is billed per token; they show how heavy a run was. Calls that returned no usage (for example, killed on timeout) are listed as missing, never estimated.
+`get_run_cost` reports input, cache-write, cache-read and output tokens, web searches and agent time per phase: verifiers, format repairs, coverage supplements, memo placement fixes and each follow-up round are listed separately. It shows two cost figures: the API-equivalent cost Claude Code reports, and an estimate from `config/models.yaml` prices. On a plan neither is billed per token; they show how heavy a run was. Calls that returned no usage (for example, killed on timeout) are listed as missing, never estimated.
 
 ## Reliability
 
@@ -304,7 +316,7 @@ It also covers:
 
 ## Known limitations
 
-- **Plan usage.** Your account is on the Pro plan. A full default run is 16 base agents (9 on Fable 5.1, 8 of them at max or xhigh effort, plus 7 on Opus 5.5). On top come up to 8 Opus verifiers and, per follow-up round, 4 Fable calls (2 adjudicators and the revised memo at max, the re-check at xhigh), each reading about as much as the completeness critic. Two automatic rounds can nearly double the Fable usage of a run. The worker waits through plan limits. Lower `agents`, `followup.max_rounds`, or set `followup.auto_start: false` per run if you need results sooner.
+- **Plan usage.** Your account is on the Pro plan. A full default run is 16 base agents (9 on Fable 5.1, 8 of them at max or xhigh effort, plus 7 on Opus 5.5). On top come up to 8 Opus verifiers and, per follow-up round, 4 Fable calls (2 adjudicators and the revised memo at max, the re-check at xhigh), each reading about as much as the completeness critic. Two automatic rounds can nearly double the Fable usage of a run. A judge, adjudicator or memo that needs a coverage supplement or placement fix costs one more call on its own model (smaller inputs than the agent itself). The worker waits through plan limits. Lower `agents`, `followup.max_rounds`, or set `followup.auto_start: false` per run if you need results sooner.
 - **Paywalled prior work** cannot be verified until you supply the PDF (`add_prior_fulltext`). Until then, verdicts that rest on it stay labelled unverified.
 - **Text that is hard to check.** Scanned PDFs without a text layer are not OCR'd. Quotes of mathematics match poorly; the prompts ask for the prose around an equation.
 - **Copyright.** Run folders contain text snapshots of third-party papers (for personal research use, which arXiv's terms allow); do not redistribute them.

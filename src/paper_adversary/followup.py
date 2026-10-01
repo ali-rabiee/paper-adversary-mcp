@@ -10,7 +10,13 @@ Round r takes the items of its critic (C1 for round 1, then the previous round's
      follow-up matrix and the same evidence gate as the judges' are computed from their rulings;
   4. a revised memo S<r+1> that disposes of every item (the gate quarantines it if one is missing or an
      unverified prior-work item is not filed as an unverified threat), which becomes the current memo;
-  5. a fresh re-check critic C<r+1>, whose new items (repeats removed) decide whether another round runs.
+  5. a fresh re-check critic C<r+1>, whose new items decide whether another round runs.
+
+Items the re-check critic re-raises (it may only do so when the handling was plainly wrong or new evidence
+exists) never start a round, since the adjudicators already ruled on them; they stay open. A review that stops
+without new items is labelled ready_for_next_gate only when nothing serious is open: no re-raised item, no FATAL
+verdict that adjudicators did not overturn, no unverified FATAL prior-work threat. Otherwise it is
+review_saturated_with_open_issues, with the list (open MAJOR BUT FIXABLE issues are listed but do not block).
 
 Nothing is overwritten: each round's records live in followup/round-<r>/, and superseded memos stay in place.
 """
@@ -35,6 +41,8 @@ from paper_adversary.search.refcheck import title_similarity
 from paper_adversary.util import atomic_write_json, atomic_write_text, read_json, sha256_text, utcnow_iso
 from paper_adversary.verification import VerificationRequest, origin_hash
 
+READY = "ready_for_next_gate"
+SATURATED = "review_saturated_with_open_issues"
 REPEAT_SIMILARITY = 0.75
 RUBBER_STAMP = 0.9  # an adjudicator agreeing with the critic (or rejecting) on this share of 5+ items is flagged
 
@@ -300,13 +308,14 @@ def check_dispositions(store, state: dict, r: int, data: dict | None) -> list[Ch
 
 
 def stop_rule(store, cfg: PipelineConfig, state: dict, r: int) -> dict:
-    """After the re-check critic: converged, max_rounds_reached, or another round (new items at/above the floor)."""
+    """After the re-check critic: another_round or max_rounds_reached while it raises new items at or above the
+    floor; otherwise ready_for_next_gate or review_saturated_with_open_issues (see the module docstring)."""
     critic_id = (((state.get("followup") or {}).get("rounds") or {}).get(str(r)) or {}).get("recheck") or f"C{r + 1}"
     side = read_json(store.sidecar_path(critic_id, "recheck", ".json"), {}) or {}
     earlier = []  # only items that were actually adjudicated or disposed of count as already handled
     for k in range(1, r + 1):
-        earlier += [it for it in (read_json(round_dir(store, k) / "items.json", {}) or {}).get("items") or []
-                    if it.get("route") in ("adjudicate", "revision")]
+        earlier += [{**it, "round": k} for it in (read_json(round_dir(store, k) / "items.json", {}) or {}).get("items")
+                    or [] if it.get("route") in ("adjudicate", "revision")]
     floor = _rank(cfg.followup.min_severity)
     new, repeats = [], []
     for it in critic_items(side.get("data"), critic_id):
@@ -315,16 +324,102 @@ def stop_rule(store, cfg: PipelineConfig, state: dict, r: int) -> dict:
         twin = _repeat_of(it, earlier)
         (repeats if twin else new).append({"id": it["id"], "type": it.get("type"), "severity": it.get("severity"),
                                             "title": it.get("title"), "repeats": twin})
-    if not new:
-        outcome = "converged"
-    elif r >= cfg.followup.max_rounds:
-        outcome = "max_rounds_reached"
+    issues = open_issues(store, state, _disputes(store, state, repeats, earlier))
+    if new:
+        outcome = "max_rounds_reached" if r >= cfg.followup.max_rounds else "another_round"
     else:
-        outcome = "another_round"
+        outcome = SATURATED if issues["blocking"] else READY
     result = {"round": r, "recheck": critic_id, "outcome": outcome, "new_items": new, "disputed_repeats": repeats,
-              "decided_at": utcnow_iso()}
+              "open_issues": issues, "decided_at": utcnow_iso()}
     atomic_write_json(round_dir(store, r) / "round.json", result)
     return result
+
+
+def _disputes(store, state: dict, repeats: list[dict], earlier: list[dict]) -> list[dict]:
+    """Re-raised items with what happened to the item they repeat: the adjudicators' rulings and the memo's
+    disposition."""
+    by_id = {it["id"]: it for it in earlier}
+    rounds = (state.get("followup") or {}).get("rounds") or {}
+    out = []
+    for rep in repeats:
+        old = by_id.get(rep["repeats"]) or {}
+        k = old.get("round")
+        rows = (read_json(round_dir(store, k) / "followup_matrix.json", {}) or {}).get("rows") or [] if k else []
+        row = next((x for x in rows if x.get("id") == old.get("id")), {})
+        revision = (rounds.get(str(k)) or {}).get("revision") if k else None
+        disp = ((read_json(store.sidecar_path(revision, "revision", ".json"), {}) or {}).get("data") or {}) \
+            if revision else {}
+        disposition = next((d.get("disposition") for d in disp.get("item_dispositions") or []
+                            if isinstance(d, dict) and str(d.get("item_id") or "").upper() == old.get("id")), None)
+        out.append({**rep, "earlier_rulings": {a: v.get("severity") for a, v in (row.get("verdicts") or {}).items()},
+                    "earlier_disposition": disposition})
+    return out
+
+
+def open_issues(store, state: dict, disputes: list[dict] | None = None) -> dict:
+    """What keeps a finished review from being ready for the next gate ("blocking": re-raised items, FATAL
+    verdicts that adjudicators did not overturn, unverified FATAL prior-work threats) and what is open but
+    fixable ("major": MAJOR BUT FIXABLE verdicts, listed only). Verdicts come from the judges' matrix, the
+    adjudicators' rulings on follow-up items, and their re-ratings of base objections (the latest round that
+    re-rated an objection decides; it overturns a FATAL only if all its adjudicators rated it lower)."""
+    rounds = (state.get("followup") or {}).get("rounds") or {}
+    flagged = set((read_json(store.role_dir("judge") / "evidence_gate.json", {}) or {}).get("flagged_ids") or [])
+    verdicts: dict[str, dict[str, str]] = {}  # objection or item ID -> {judge or adjudicator: severity}
+    titles: dict[str, str] = {}
+    for row in (read_json(store.role_dir("judge") / "judgment_matrix.json", {}) or {}).get("rows") or []:
+        verdicts[row["id"]] = {j: v.get("severity") for j, v in (row.get("verdicts") or {}).items()}
+        titles[row["id"]] = row.get("title") or ""
+    rerated: dict[str, tuple[int, dict[str, str]]] = {}
+    for k in sorted(int(x) for x in rounds):
+        fm = read_json(round_dir(store, k) / "followup_matrix.json", {}) or {}
+        flagged |= set((fm.get("gate") or {}).get("flagged_ids") or [])
+        for row in fm.get("rows") or []:
+            verdicts[row["id"]] = {a: v.get("severity") for a, v in (row.get("verdicts") or {}).items()}
+            titles[row["id"]] = row.get("title") or ""
+        for u in fm.get("objection_updates") or []:
+            oid, sev = str(u.get("objection_id") or "").strip().upper(), normalize_severity(u.get("severity"))
+            if oid and sev and u.get("adjudicator"):
+                if rerated.get(oid, (0, {}))[0] < k:
+                    rerated[oid] = (k, {})
+                rerated[oid][1][u["adjudicator"]] = sev
+    for oid, (k, by) in rerated.items():
+        panel = [a for a in (rounds.get(str(k)) or {}).get("adjudicators") or []
+                 if (state["agents"].get(a) or {}).get("status") == "complete"]
+        current = dict(verdicts.get(oid) or {})
+        if panel and all(by.get(a) not in (None, "FATAL") for a in panel):  # every adjudicator rated it lower
+            current = {j: s for j, s in current.items() if s != "FATAL"}
+        current.update(by)
+        verdicts[oid] = current
+    fatal, unverified, major = [], [], []
+    for oid in sorted(verdicts):
+        by = sorted(j for j, sev in verdicts[oid].items() if sev == "FATAL")
+        entry = {"id": oid, "title": titles.get(oid, "")[:120], "by": by}
+        if by:
+            (unverified if oid in flagged else fatal).append(entry)
+        else:
+            majors = sorted(j for j, sev in verdicts[oid].items() if sev == "MAJOR_FIXABLE")
+            if majors:
+                major.append({**entry, "by": majors, "unverified": oid in flagged})
+    blocking = {"reraised": list(disputes or []), "fatal": fatal, "unverified_fatal": unverified}
+    return {"blocking": blocking if any(blocking.values()) else {}, "major": major}
+
+
+def open_issue_lines(issues: dict) -> list[str]:
+    """Short status lines for open issues."""
+    b = issues.get("blocking") or {}
+    lines = []
+    if b.get("reraised"):
+        lines.append("re-raised by the re-check critic: " + ", ".join(
+            f"{d['id']} (repeats {d['repeats']}; earlier ruled "
+            + (", ".join(f"{a} {SEVERITY_LABEL.get(s, s)}" for a, s in (d.get("earlier_rulings") or {}).items())
+               or "—") + f", {d.get('earlier_disposition') or 'no disposition'})" for d in b["reraised"]))
+    if b.get("fatal"):
+        lines.append("FATAL verdicts standing: " + ", ".join(f"{x['id']} ({'/'.join(x['by'])})" for x in b["fatal"]))
+    if b.get("unverified_fatal"):
+        lines.append("unverified FATAL prior-work threats: " + ", ".join(x["id"] for x in b["unverified_fatal"]))
+    if issues.get("major"):
+        lines.append(f"open MAJOR BUT FIXABLE (not blocking): {len(issues['major'])}")
+    return lines
 
 
 def _repeat_of(item: dict, earlier: list[dict]) -> str | None:
@@ -354,6 +449,10 @@ def round_summary(store, state: dict) -> list[str]:
         bits = ", ".join(f"{v} {k}" for k, v in sorted(routes.items())) or "no items"
         lines.append(f"Follow-up round {r}: {rnd.get('status')} — items of {rnd.get('critic')}: {bits}"
                      + (f"; outcome {rnd['outcome']}" if rnd.get("outcome") else ""))
+        if rnd.get("outcome") in (READY, SATURATED, "max_rounds_reached"):
+            record = read_json(round_dir(store, int(r)) / "round.json", {}) or {}
+            issues = record.get("open_issues") or rnd.get("open_issues") or {}
+            lines += [f"  Open: {line}" for line in open_issue_lines(issues)]
     if fu.get("current_memo") and fu["current_memo"] != "S1":
         lines.append(f"Current memo: {fu['current_memo']} (revised; earlier memos are kept)")
     return lines

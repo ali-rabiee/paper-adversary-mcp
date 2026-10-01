@@ -243,6 +243,19 @@ class RunStore:
         return dest
 
 
+    def archive_copy(self, path: Path, agent_id: str, role: str, reason: str) -> Path:
+        """Copy one output into archive/<timestamp>/ before the orchestrator edits it in place (never lose a
+        version)."""
+        stamp = utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+        dest = self.dir / "archive" / stamp / ROLE_DIR[role]
+        dest.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(path, dest / path.name)
+        append_jsonl(self.dir / "archive" / "index.jsonl",
+                     {"at": utcnow_iso(), "agent_id": agent_id, "role": role, "reason": reason,
+                      "copied_to": self.rel(dest), "files": [path.name]})
+        return dest
+
+
 def list_runs(root: Path | None = None) -> list[RunStore]:
     root = root or runs_root()
     if not root.is_dir():

@@ -322,6 +322,13 @@ def next_step(state: dict, label: str, followup_configured: bool = False) -> str
         return (f"Review complete. The round cap was reached while the re-check critic still raised new serious "
                 f"items ({', '.join(last['new_items'])}); they are not in the current memo. Read "
                 "get_report(run_id, 'memo') and get_report(run_id, 'recheck').")
+    if last and last.get("outcome") == followup.SATURATED:
+        return ("Review complete, with open issues (listed above under the follow-up round): standing FATAL "
+                "verdicts, unverified FATAL prior-work threats, or items the re-check critic re-raised. Not ready for "
+                "the next gate. The current memo, get_report(run_id, 'memo'), says what to fix or check.")
+    if last and last.get("outcome") == followup.READY:
+        return ("Review complete and ready for the next gate: nothing serious is open. Read get_report(run_id, "
+                "'memo'), the current memo; its open MAJOR BUT FIXABLE issues still need fixing.")
     return ("Review complete. Read get_report(run_id, 'memo') (the current memo) and get_report(run_id, 'critic'); "
             "the judgment matrix is get_report(run_id, 'matrix')."
             + (" run_followup(run_id, dry_run=true) shows what a follow-up round would do."

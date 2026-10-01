@@ -147,56 +147,18 @@ class ContextBuilder:
         missing_agents: list[str] = []
         rubric_label = None
         if spec.role in ("judge", "synthesis", "critic") or followup:
-            refuter_records = []
-            refchecks: dict[str, str] = {}
-            for kind in REFUTER_ROLES:
-                recs = access.reports(kind, state)
-                refuter_records += recs
-                if kind == "novelty":
-                    for rec in recs:
-                        notes = []
-                        data = access.sidecar("refcheck", rec.agent_id, "novelty", ".refcheck.json")
-                        if data and data.get("items") is not None:
-                            notes.append(refcheck_markdown(data, rec.agent_id))
-                        evidence = access.sidecar("evidence", rec.agent_id, "novelty", ".evidence.json")
-                        if evidence:
-                            notes.append(evidence_markdown(evidence))
-                        if notes:
-                            refchecks[rec.agent_id] = "\n\n".join(notes)
-                            access.allow_text(refchecks[rec.agent_id])
+            refuter_records, refchecks = self._refuter_reports(access, state)
             expected = [aid for aid, a in state["agents"].items() if a["role"] in REFUTER_ROLES]
             got = {r.agent_id for r in refuter_records}
             gone = [aid for aid in expected if aid not in got]
             missing += [unavailable_label(aid, state["agents"][aid]) for aid in gone]
             missing_agents += gone
             blocks.append(self._report_block("refuter_reports", refuter_records, refchecks))
-            vdir = self.store.role_dir("verifier")
-            # base readers read only the base checks, so follow-up verifications never make them stale
-            results_path = vdir / ("results.json" if followup or not (vdir / "base_results.json").is_file()
-                                   else "base_results.json")
-            if results_path.is_file():
-                rendered = verification_markdown(json.loads(access.file("verification", results_path)),
-                                                 batches=visible_batches(position(spec.role, spec.round)),
-                                                 hashes=self._objection_hashes(access, refuter_records))
-                if rendered:
-                    access.allow_text(rendered)
-                    blocks.append("<independent_verifications source=\"orchestrator; blind verifiers\">\n"
-                                  + rendered + "\n</independent_verifications>")
+            blocks.append(self._verification_block(spec, access, refuter_records, followup))
             if spec.role == "judge" and self.cfg.gates.judge_coverage.objection_index:
                 blocks.append(self._objection_index(access, refuter_records))
-            rubric_file = self.store.source_dir / "rubric.md"
-            if rubric_file.is_file():  # a per-run rubric, copied into the run when it was created
-                raw = rubric_file.read_text(encoding="utf-8")
-                label, text = self.meta.get("rubric") or "run rubric", raw.strip()
-                access.note_input("rubric", rubric_file, sha256_text(raw))
-            else:
-                label, text = load_rubric(self.meta.get("rubric") or self.cfg.rubric)
-                if text:
-                    access.note_input("rubric", None, sha256_text(text))
-            if text:
-                access.allow_text(text)
-                blocks.append(f"<rubric source=\"{label}\">\n{text}\n</rubric>")
-                rubric_label = label
+            rubric_label, rubric = self._rubric(access)
+            blocks.append(rubric)
         if spec.role in ("synthesis", "critic") or followup:
             judge_records = access.reports("judge", state)
             expected = [aid for aid, a in state["agents"].items() if a["role"] == "judge"]
@@ -234,6 +196,114 @@ class ContextBuilder:
                           + "\n</missing_inputs>")
 
         assignment = self._assignment(spec, prompt, state)
+        return self._assemble(spec, state, window_scale, access, prompt, system, blocks, assignment, rubric_label,
+                              missing, missing_agents)
+
+    def build_supplement(self, spec: AgentSpec, state: dict, ids: list[str], own_report: str,
+                         request: str) -> BuiltContext:
+        """A judge's or adjudicator's coverage supplement: its own role prompt and paper view, only the reports
+        that raised the IDs it must still rule on (with the orchestrator's checks of them), its own report, and
+        the request. The isolation rules are the agent's own; its own report is allowed text."""
+        access = ArtifactAccess(self.store, spec.role, spec.agent_id, position(spec.role, spec.round))
+        access.note_input("paper", self.store.source_dir / "extracted_text.md", sha256_text(self.text))
+        access.allow_text(self.text)
+        access.allow_text(own_report)
+        prompt = load_prompt(spec.prompt_name)
+        n_role = self.cfg.followup.adjudicators if spec.role == "adjudicator" else self.cfg.role(spec.role).agents
+        system = prompt.render({"agent_id": spec.agent_id, "n_agents": n_role,
+                                "venue": self.meta.get("venue") or "the target venue",
+                                "field": self.meta.get("field") or "the paper's field"})
+        wanted = set(ids)
+        blocks: list[str] = []
+        rubric_label = None
+        if spec.role == "judge":
+            owners = {i.split("-", 1)[0] for i in wanted}
+            records, notes = self._refuter_reports(access, state, owners)
+            blocks.append(self._report_block("refuter_reports", records, notes))
+            blocks.append(self._verification_block(spec, access, records, False, wanted))
+            rubric_label, rubric = self._rubric(access)
+            blocks.append(rubric)
+        else:
+            critic_id, _ = round_critic(state, spec.round)
+            critics = {c.agent_id: c for c in access.reports("critic", state) + access.reports("recheck", state)}
+            if critic_id in critics:
+                blocks.append(f'<critic_report agent_id="{critic_id}">\n{critics[critic_id].body.strip()}\n'
+                              "</critic_report>")
+            items_path = round_dir(self.store, spec.round) / "items.md"
+            if items_path.is_file():
+                blocks.append("<item_triage source=\"orchestrator\">\n" + access.file("followup", items_path)
+                              + "</item_triage>")
+            results_path = self.store.role_dir("verifier") / "results.json"
+            if results_path.is_file():
+                rendered = verification_markdown(json.loads(access.file("verification", results_path)), wanted)
+                if rendered:
+                    access.allow_text(rendered)
+                    blocks.append("<followup_verifications source=\"orchestrator; blind verifiers\">\n"
+                                  + rendered + "\n</followup_verifications>")
+            matrix = self.store.role_dir("judge") / "judgment_matrix.md"
+            if matrix.is_file():
+                blocks.append("<judgment_matrix source=\"orchestrator (computed from structured blocks)\">\n"
+                              + access.file("matrix", matrix) + "\n</judgment_matrix>")
+        blocks.append(f'<your_report agent_id="{spec.agent_id}">\n{own_report.strip()}\n</your_report>')
+        return self._assemble(spec, state, 1.0, access, prompt, system, blocks, request, rubric_label, [], [])
+
+    def _refuter_reports(self, access: ArtifactAccess, state: dict, only: set[str] | None = None):
+        """Complete refuter reports (all, or only these agents') and the orchestrator's checks of novelty ones."""
+        records = []
+        notes: dict[str, str] = {}
+        for kind in REFUTER_ROLES:
+            recs = [r for r in access.reports(kind, state) if only is None or r.agent_id in only]
+            records += recs
+            if kind == "novelty":
+                for rec in recs:
+                    parts = []
+                    data = access.sidecar("refcheck", rec.agent_id, "novelty", ".refcheck.json")
+                    if data and data.get("items") is not None:
+                        parts.append(refcheck_markdown(data, rec.agent_id))
+                    evidence = access.sidecar("evidence", rec.agent_id, "novelty", ".evidence.json")
+                    if evidence:
+                        parts.append(evidence_markdown(evidence))
+                    if parts:
+                        notes[rec.agent_id] = "\n\n".join(parts)
+                        access.allow_text(notes[rec.agent_id])
+        return records, notes
+
+    def _verification_block(self, spec: AgentSpec, access: ArtifactAccess, refuter_records, followup: bool,
+                            origin_ids: set[str] | None = None) -> str:
+        vdir = self.store.role_dir("verifier")
+        # base readers read only the base checks, so follow-up verifications never make them stale
+        results_path = vdir / ("results.json" if followup or not (vdir / "base_results.json").is_file()
+                               else "base_results.json")
+        if not results_path.is_file():
+            return ""
+        rendered = verification_markdown(json.loads(access.file("verification", results_path)), origin_ids,
+                                         batches=visible_batches(position(spec.role, spec.round)),
+                                         hashes=self._objection_hashes(access, refuter_records))
+        if not rendered:
+            return ""
+        access.allow_text(rendered)
+        return ("<independent_verifications source=\"orchestrator; blind verifiers\">\n" + rendered
+                + "\n</independent_verifications>")
+
+    def _rubric(self, access: ArtifactAccess) -> tuple[str | None, str]:
+        rubric_file = self.store.source_dir / "rubric.md"
+        if rubric_file.is_file():  # a per-run rubric, copied into the run when it was created
+            raw = rubric_file.read_text(encoding="utf-8")
+            label, text = self.meta.get("rubric") or "run rubric", raw.strip()
+            access.note_input("rubric", rubric_file, sha256_text(raw))
+        else:
+            label, text = load_rubric(self.meta.get("rubric") or self.cfg.rubric)
+            if text:
+                access.note_input("rubric", None, sha256_text(text))
+        if not text:
+            return None, ""
+        access.allow_text(text)
+        return label, f"<rubric source=\"{label}\">\n{text}\n</rubric>"
+
+    def _assemble(self, spec: AgentSpec, state: dict, window_scale: float, access: ArtifactAccess,
+                  prompt: PromptTemplate, system: str, blocks: list[str], assignment: str, rubric_label: str | None,
+                  missing: list[str], missing_agents: list[str]) -> BuiltContext:
+        """Fit the paper into what the other inputs leave of the model's window, then put the prompt together."""
         other = "\n\n".join(b for b in blocks if b)
 
         # Budget: fit the paper into what is left after everything else.

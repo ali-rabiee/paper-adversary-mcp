@@ -633,26 +633,111 @@ def check_structured(st: Structured) -> Check:
                  {"source": st.source, "as_written": st.as_written, "warnings": st.warnings})
 
 
-def check_coverage(judgments: list[dict], expected: set[str], min_fraction: float) -> Check:
-    counts: dict[str, int] = {}
-    for j in judgments:
-        for oid in j.get("objection_ids") or []:
-            counts[oid] = counts.get(oid, 0) + 1
-    covered = set(counts) & expected
-    missing = sorted(expected - covered)
-    unknown = sorted(set(counts) - expected)
-    duplicates = {k: v for k, v in counts.items() if v > 1}
-    fraction = len(covered) / len(expected) if expected else 1.0
-    details = {"expected": len(expected), "classified": len(covered), "fraction": round(fraction, 3),
-               "missing": missing, "unknown": unknown, "duplicates": duplicates}
-    if expected and fraction < min_fraction:
-        return Check("judge_coverage", BLOCK, "quality", f"classified only {len(covered)} of {len(expected)} "
-                     f"objections (minimum {min_fraction:.0%})", details)
-    if missing or unknown or duplicates:
-        bits = ([f"{len(missing)} not classified"] if missing else []) + \
-               ([f"unknown IDs {', '.join(unknown[:5])}"] if unknown else []) + \
-               ([f"classified twice: {', '.join(sorted(duplicates)[:5])}"] if duplicates else [])
-        return Check("judge_coverage", WARN, "quality", "; ".join(bits), details)
+def entry_ids(entry: dict, key: str) -> list[str]:
+    """The IDs a judgment or ruling covers ("objection_ids", or a single "objection_id"; likewise for items)."""
+    return _norm_ids(entry.get(key) or entry.get(key[:-1]))
+
+
+def coverage_status(entries: list[dict], key: str, expected: set[str]) -> dict:
+    """Which expected IDs a judge (key "objection_ids") or adjudicator ("item_ids") left out, gave two different
+    severities, or classified twice with the same severity; and which IDs it cited that do not exist."""
+    seen: dict[str, list[str]] = {}
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        for oid in entry_ids(e, key):
+            seen.setdefault(oid, []).append(normalize_severity(e.get("severity")))
+    return {"missing": sorted(expected - set(seen)),
+            "conflicts": {oid: sevs for oid, sevs in sorted(seen.items()) if len(set(sevs)) > 1},
+            "repeated": sorted(oid for oid, sevs in seen.items() if len(sevs) > 1 and len(set(sevs)) == 1),
+            "unknown": sorted(set(seen) - expected)}
+
+
+def drop_ids(entries: list[dict], key: str, ids: set[str], keep_first: bool = False) -> list[dict]:
+    """Remove these IDs from the entries (all occurrences, or all but the first with keep_first); an entry left
+    without IDs is dropped. Entries without any of these IDs are returned unchanged."""
+    out, seen = [], set()
+    for e in entries:
+        if not isinstance(e, dict):
+            out.append(e)
+            continue
+        mine = entry_ids(e, key)
+        if not set(mine) & ids:
+            out.append(e)
+            seen.update(mine)
+            continue
+        keep = [i for i in mine if i not in ids or (keep_first and i not in seen)]
+        seen.update(mine)
+        if keep:
+            out.append({**{k: v for k, v in e.items() if k != key[:-1]}, key: keep})
+    return out
+
+
+ADDENDUM = "<!-- orchestrator: coverage supplement -->"  # what follows was appended to a report by the gate
+
+
+def without_addendum(text: str) -> str:
+    """A report as its agent wrote it, without what the gate appended (a coverage supplement)."""
+    return text.split(ADDENDUM, 1)[0]
+
+
+def prose_without_block(text: str) -> str:
+    """A reply's Markdown with its last fenced block (the JSON) removed."""
+    blocks = _fences(text.replace("\r\n", "\n"))
+    if not blocks:
+        return text.strip()
+    norm = text.replace("\r\n", "\n")
+    return (norm[: blocks[-1].start] + norm[blocks[-1].end:]).strip()
+
+
+def coverage_keys(role: str) -> tuple[str, str]:
+    """(list key, ID key) of a judge's judgments or an adjudicator's rulings."""
+    return ("judgments", "objection_ids") if role == "judge" else ("rulings", "item_ids")
+
+
+def validate_supplement(role: str, data: dict | None, wanted: list[str]) -> tuple[list[dict], list[str], list[str]]:
+    """(rulings, rejections, warnings) of a coverage supplement: its rulings with normalized IDs, any ID it was
+    not asked about removed (it may not change other rulings); a missing or malformed block is rejected."""
+    list_key, key = coverage_keys(role)
+    if not isinstance(data, dict) or not isinstance(data.get(list_key), list):
+        return [], [f"the supplement has no JSON block with '{list_key}'"], []
+    hard, _ = validate_block(role, {list_key: data[list_key]})
+    if hard:
+        return [], hard[:3], []
+    asked, entries, extra = set(wanted), [], set()
+    for e in data[list_key]:
+        ids = entry_ids(e, key)
+        extra |= set(ids) - asked
+        keep = [i for i in ids if i in asked]
+        if keep:
+            entries.append({**{k: v for k, v in e.items() if k != key[:-1]}, key: keep, "origin": "supplement"})
+    warnings = [f"the supplement also ruled on IDs it was not asked about (ignored): {', '.join(sorted(extra))}"] \
+        if extra else []
+    return entries, [], warnings
+
+
+def check_coverage(judgments: list[dict], expected: set[str], min_fraction: float,
+                   key: str = "objection_ids") -> Check:
+    """Every expected ID classified exactly once (below min_fraction, or two different severities for one ID,
+    blocks; the pipeline first asks the agent for a targeted supplement)."""
+    st = coverage_status(judgments, key, expected)
+    covered = len(expected) - len(st["missing"])
+    fraction = covered / len(expected) if expected else 1.0
+    details = {"expected": len(expected), "classified": covered, "fraction": round(fraction, 3), **st}
+    problems = []
+    if st["missing"]:
+        problems.append(f"{len(st['missing'])} not classified ({', '.join(st['missing'][:8])})")
+    if st["conflicts"]:
+        problems.append("two different severities for " + ", ".join(sorted(st["conflicts"])[:8]))
+    if st["unknown"]:
+        problems.append(f"unknown IDs {', '.join(st['unknown'][:5])}")
+    if st["repeated"]:
+        problems.append(f"classified twice: {', '.join(st['repeated'][:5])}")
+    if (expected and fraction < min_fraction) or st["conflicts"]:
+        return Check("judge_coverage", BLOCK, "quality", f"classified {covered} of {len(expected)}: "
+                     + "; ".join(problems), details)
+    if problems:
+        return Check("judge_coverage", WARN, "quality", "; ".join(problems), details)
     return Check("judge_coverage", PASS, "quality", "", details)
 
 
@@ -689,29 +774,107 @@ def check_sections(text: str, required: list[tuple[int, str]], mode: str) -> Che
     return Check("sections", result, "quality", message, details)
 
 
+def section_spans(text: str) -> list[tuple[int, str, int, int]]:
+    """(number, title, start, end) of each '## N. Title' section outside fenced blocks, in a \\n-normalized text;
+    a section ends where the next numbered section starts."""
+    fences = [(f.start, f.end) for f in _fences(text)]
+    heads, k = [], 0
+    for start, _, line in _lines(text):
+        while k < len(fences) and fences[k][1] < start:
+            k += 1
+        if k < len(fences) and fences[k][0] <= start <= fences[k][1]:
+            continue
+        m = _NUM_SECTION.match(line)
+        if m and m.group(2).strip():
+            heads.append((int(m.group(1)), m.group(2).strip(), start))
+    return [(n, title, start, heads[i + 1][2] if i + 1 < len(heads) else len(text))
+            for i, (n, title, start) in enumerate(heads)]
+
+
 def section_text(text: str, number: int) -> str:
-    """The body of the memo section numbered `number` ('## 6. ...'), up to the next numbered section."""
+    """The body of the memo section numbered `number` ('## 6. ...'), up to the next numbered section, with
+    fenced blocks blanked out."""
     body = _strip_fenced(text)
-    m = re.search(rf"^##[ \t]+{number}\.[^\n]*\n(.*?)(?=^##[ \t]+\d+\.|\Z)", body, re.M | re.S)
-    return m.group(1) if m else ""
+    for n, _, start, end in section_spans(body):
+        if n == number:
+            nl = body.find("\n", start, end)
+            return body[nl + 1: end] if nl != -1 else ""
+    return ""
+
+
+_ENTRY_ID = re.compile(r"\b[A-Z]{1,2}\d{1,3}-[OI]\d{1,3}\b")
+_LEAD_IDS = re.compile(r"[A-Z]{1,2}\d{1,3}-[OI]\d{1,3}(?:[ \t]*(?:,|;|/|&|and)[ \t]*[A-Z]{1,2}\d{1,3}-[OI]\d{1,3})*")
+_LIST_MARK = re.compile(r"(?:[-*+]|\d{1,3}[.)])[ \t]+")
+
+
+def lead_ids(section: str) -> set[str]:
+    """The objection or item IDs the entries of a memo section lead with: a table row's first cell, an entry's
+    opening bold span, or the IDs a list item opens with. A passing mention later in an entry does not count
+    (the memo prompts ask every entry in sections 5 and 6 to start with the IDs it covers)."""
+    out: set[str] = set()
+    for _, _, raw in _lines(section):
+        if len(raw) - len(raw.lstrip(" \t")) >= 2:  # indented: part of the entry above
+            continue
+        line = raw.strip()
+        if line.startswith("|"):
+            cells = line.strip("|").split("|")
+            if all(not c.strip(" :-") for c in cells):  # a table's separator row
+                continue
+            lead = cells[0]
+        else:
+            m = _LIST_MARK.match(line)
+            body = line[m.end():] if m else line
+            if body.startswith("**"):
+                close = body.find("**", 2)
+                lead = body[2:close] if close != -1 else body[2:]
+            elif m:
+                opening = _LEAD_IDS.match(body)
+                lead = opening.group(0) if opening else ""
+            else:
+                continue  # running prose, not an entry
+        out.update(_ENTRY_ID.findall(lead))
+    return out
+
+
+def placement_sections(required: list[tuple[int, str]]) -> tuple[int | None, int | None]:
+    """The numbers of the 'Criticisms that survived judging' and 'Unverified threats' sections."""
+    survived = next((n for n, t in required if _title_key(t).startswith("criticisms that survived")), None)
+    unverified = next((n for n, t in required if _title_key(t).startswith("unverified threats")), None)
+    return survived, unverified
 
 
 def check_unverified_placement(text: str, required: list[tuple[int, str]], flagged: list[str],
                                block: bool) -> Check:
-    """Gated (unverified) objections must sit under 'Unverified threats', not 'Criticisms that survived judging'."""
-    survived = next((n for n, t in required if _title_key(t).startswith("criticisms that survived")), None)
-    unverified = next((n for n, t in required if _title_key(t).startswith("unverified threats")), None)
+    """Gated (unverified) objections must sit under 'Unverified threats': none may lead an entry of 'Criticisms
+    that survived judging', and each must be named in 'Unverified threats'."""
+    survived, unverified = placement_sections(required)
     if not flagged or survived is None or unverified is None:
         return Check("unverified_placement", PASS, "quality")
     ids = set(flagged)
-    misplaced = sorted(i for i in ids if re.search(rf"\b{re.escape(i)}\b", section_text(text, survived)))
-    absent = sorted(i for i in ids if not re.search(rf"\b{re.escape(i)}\b", section_text(text, unverified)))
+    misplaced = sorted(ids & lead_ids(section_text(text, survived)))
+    six = section_text(text, unverified)
+    absent = sorted(i for i in ids if not re.search(rf"\b{re.escape(i)}\b", six))
     if not misplaced and not absent:
         return Check("unverified_placement", PASS, "quality")
     bits = ([f"unverified objections listed as surviving criticisms: {', '.join(misplaced)}"] if misplaced else []) + \
            ([f"unverified objections missing from 'Unverified threats': {', '.join(absent)}"] if absent else [])
-    return Check("unverified_placement", BLOCK if block and misplaced else WARN, "quality", "; ".join(bits),
+    return Check("unverified_placement", BLOCK if block else WARN, "quality", "; ".join(bits),
                  {"misplaced": misplaced, "absent": absent})
+
+
+def splice_sections(text: str, replacement: str, first: int, last: int) -> str | None:
+    """`text` with its numbered sections first..last replaced by `replacement`, which must consist of exactly
+    those sections. Sections of the range that `text` lacks are thereby inserted (a memo that left out section 6);
+    None if `text` lacks section `first` or the replacement is not exactly first..last."""
+    text = text.replace("\r\n", "\n")
+    spans = section_spans(text)
+    starts = [s for n, _, s, _ in spans if n == first]
+    got = [n for n, _, _, _ in section_spans(replacement.replace("\r\n", "\n"))]
+    if not starts or got != list(range(first, last + 1)):
+        return None
+    start = starts[0]
+    end = next((s for n, _, s, _ in spans if s > start and not first <= n <= last), len(text))
+    return text[:start] + replacement.strip() + "\n\n" + text[end:].lstrip("\n")
 
 
 def unavailable_label(agent_id: str, entry: dict) -> str:

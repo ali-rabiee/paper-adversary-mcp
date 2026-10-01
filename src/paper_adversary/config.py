@@ -36,6 +36,8 @@ STAGE_LABEL = {
     "revision": "Revised memo",
     "recheck": "Re-check critic",
     "repair": "Format repair",
+    "supplement": "Coverage supplements",
+    "placement_fix": "Memo placement fixes",
 }
 
 ToolName = Literal["web_search", "web_fetch", "literature", "prior_text"]
@@ -168,13 +170,21 @@ class StructuredGate(_Strict):
 
 
 class CoverageGate(_Strict):
-    min_fraction: float = Field(0.5, ge=0, le=1)  # a judge classifying less than this share is quarantined
+    min_fraction: float = Field(1.0, ge=0, le=1)  # share each judge/adjudicator must classify (after a supplement)
     objection_index: bool = True  # list every objection ID in each judge's assignment
 
 
 class SectionsGate(_Strict):
     synthesis: Literal["block_any", "block_incomplete", "warn"] = "block_incomplete"
     critic: Literal["block_any", "block_incomplete", "warn"] = "warn"
+
+
+class TargetedCallConfig(_Strict):
+    """A gate-side call on the agent's own model and effort: a coverage supplement or a memo placement fix."""
+    enabled: bool = True
+    prompt: str
+    timeout_minutes: float = Field(45, gt=0)
+    max_attempts: int = Field(2, ge=1, le=5)
 
 
 class RepairConfig(_Strict):
@@ -193,6 +203,9 @@ class GatesConfig(_Strict):
     judge_coverage: CoverageGate = Field(default_factory=CoverageGate)
     sections: SectionsGate = Field(default_factory=SectionsGate)
     repair: RepairConfig = Field(default_factory=RepairConfig)
+    coverage_supplement: TargetedCallConfig = Field(
+        default_factory=lambda: TargetedCallConfig(prompt="coverage_supplement_v1"))
+    placement_fix: TargetedCallConfig = Field(default_factory=lambda: TargetedCallConfig(prompt="placement_fix_v1"))
 
 
 class BudgetConfig(_Strict):

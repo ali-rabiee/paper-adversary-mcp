@@ -19,12 +19,14 @@ Runs inside the worker process. Guarantees:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import datetime as dt
 import random
 import re
 import shutil
 import statistics
 import time
+from pathlib import Path
 
 from paper_adversary import followup, gates
 from paper_adversary.budget import BudgetError
@@ -47,6 +49,7 @@ from paper_adversary.prompts import PromptTemplate, load_prompt
 from paper_adversary.providers import RUN_FATAL, AgentRequest, AgentResult, ErrorKind, ProviderError, make_provider
 from paper_adversary.registry import ModelRegistry
 from paper_adversary.reports import (
+    SEVERITY_LABEL,
     build_judgment_matrix,
     judge_judgments,
     matrix_markdown,
@@ -705,7 +708,7 @@ class Pipeline:
             return False
         try:
             _, body = read_report(self.store.report_path(aid, role))
-            text = strip_marker(body).strip()
+            text = gates.without_addendum(strip_marker(body)).strip()  # as the agent wrote it
             prompt = load_prompt(gate["prompt"]["name"])
             facts = gate["facts"]
             gcfg = self.cfg.gates
@@ -723,24 +726,36 @@ class Pipeline:
                     st = await self._repair(spec, text, st, prompt)
                 checks.append(gates.check_structured(st))
             checks.append(gates.check_truncation(facts.get("stop_reason"), st.source == "ok", gcfg.truncation))
-            if role == "judge" and st.usable:
-                checks.append(gates.check_coverage(judge_judgments(st.data), self._expected_objections(aid),
-                                                   gcfg.judge_coverage.min_fraction))
+            # Targeted calls (a coverage supplement, a placement fix) are made only for an output that nothing
+            # else blocks: an output that is quarantined anyway is not worth another call.
+            blocked = any(c.result == gates.BLOCK for c in checks)
+            if role in ("judge", "adjudicator") and st.usable:
+                expected = self._expected_objections(aid) if role == "judge" else self._expected_items(spec)
+                if not blocked:
+                    st, notes = await self._complete_coverage(spec, text, st, expected)
+                    if notes:
+                        checks.append(gates.Check("coverage_supplement", gates.WARN, "quality", "; ".join(notes)))
+                list_key, key = gates.coverage_keys(role)
+                checks.append(gates.check_coverage(st.data.get(list_key) or [], expected,
+                                                   gcfg.judge_coverage.min_fraction, key))
             mode = {"synthesis": gcfg.sections.synthesis, "critic": gcfg.sections.critic,
                     "recheck": gcfg.sections.critic, "revision": "block_any"}.get(role, "warn")
             required = gates.required_sections(prompt.body)
-            checks.append(gates.check_sections(text, required, mode))
-            if role in ("synthesis", "revision"):
-                flagged = (read_json(self.store.role_dir("judge") / "evidence_gate.json", {}) or {}).get("flagged_ids")
-                checks.append(gates.check_unverified_placement(text, required, flagged or [], block=False))
-            if role == "adjudicator" and st.usable:
-                record = read_json(followup.round_dir(self.store, spec.round) / "items.json", {}) or {}
-                expected = {it["id"] for it in record.get("items") or [] if it["route"] == "adjudicate"}
-                rulings = [{"objection_ids": [str(i).upper() for i in r.get("item_ids") or []]}
-                           for r in st.data.get("rulings") or [] if isinstance(r, dict)]
-                checks.append(gates.check_coverage(rulings, expected, gcfg.judge_coverage.min_fraction))
             if role == "revision" and st.usable:
                 checks += followup.check_dispositions(self.store, self.store.load_state(), spec.round, st.data)
+            if role in ("synthesis", "revision"):
+                flagged = self._flagged_for(spec)
+                placement = gates.check_unverified_placement(text, required, flagged, block=True)
+                if placement.result == gates.BLOCK and not any(
+                        c.result == gates.BLOCK for c in checks + [gates.check_sections(text, required, mode)]):
+                    text = await self._placement_fix(spec, text, required, flagged, placement)
+                    placement = gates.check_unverified_placement(text, required, flagged, block=True)
+                fix = (read_json(gate_path) or {}).get("placement_fix") or {}
+                if fix.get("outcome") == "accepted":  # also after a resume, when the fixed memo is already on disk
+                    checks.append(gates.Check("placement_fix", gates.WARN, "quality", "sections 5-6 rewritten by a "
+                                              f"placement fix ({fix.get('problem') or 'misfiled unverified threats'})"))
+                checks.append(placement)
+            checks.append(gates.check_sections(text, required, mode))
         except GateInterrupted:
             return False
         except Exception as exc:  # the output is safe on disk; a resume retries the checks, but not forever
@@ -845,6 +860,11 @@ class Pipeline:
         self._set(aid, archived_to=self.store.rel(dest) if dest else None)
         self.store.event("agent_auto_rerun", agent_id=aid, reason=reason)
 
+    def _expected_items(self, spec: AgentSpec) -> set[str]:
+        """Follow-up items an adjudicator must rule on: those its round routed to adjudication."""
+        record = read_json(followup.round_dir(self.store, spec.round) / "items.json", {}) or {}
+        return {it["id"] for it in record.get("items") or [] if it["route"] == "adjudicate"}
+
     def _expected_objections(self, judge_id: str) -> set[str]:
         """Objection IDs of the refuter reports this judge was actually given (from its context manifest)."""
         ctx = read_json(self.store.sidecar_path(judge_id, "judge", ".context.json"), {}) or {}
@@ -866,24 +886,231 @@ class Pipeline:
                          if role == "novelty" else None)
         if rep.get("outcome") in ("rejected", "failed"):
             return gates.fallback(role, text, st.as_written, fallback_note)
-        alias = spec.model_alias if rcfg.model == "agent" else rcfg.model
-        info = self.registry.resolve(alias)
         repair_prompt = load_prompt(rcfg.prompt)
         system = repair_prompt.render({"agent_id": aid, "role": role})
         user = gates.repair_user_text(role, text, gates.json_shape(prompt.body), st.repair_mode or "transcribe",
                                       st.as_written, st.broken_block)
-        self.guard.check_prompt(role, aid, system + "\n" + user, allowed_text=text, pos=position(role, spec.round))
+        rep.update(mode=st.repair_mode, prompt_version=repair_prompt.name, prompt_sha256=repair_prompt.sha256)
+        result, problems = await self._side_call(
+            spec, gate, "repair", model=spec.model_alias if rcfg.model == "agent" else rcfg.model, effort=rcfg.effort,
+            system=system, user=user, allowed_text=text, timeout_minutes=rcfg.timeout_minutes,
+            max_attempts=rcfg.max_attempts, detail="repairing the structured block")
+        if result is None:
+            self.store.event("repair_failed", agent_id=aid, errors=rep.get("errors", []))
+            return gates.fallback(role, text, st.as_written, fallback_note)
+        data, rejections, warnings = gates.validate_repair(role, st.repair_mode or "transcribe", result.text,
+                                                           text, st.broken_block)
+        rejections += problems
+        if rejections or data is None:
+            rep.update(outcome="rejected", rejections=rejections)
+            atomic_write_json(gate_path, gate)
+            self.store.event("repair_rejected", agent_id=aid, rejections=rejections)
+            return gates.fallback(role, text, st.as_written, fallback_note)
+        rep.update(outcome="accepted")
+        atomic_write_json(gate_path, gate)
+        self.store.event("repair_accepted", agent_id=aid, mode=st.repair_mode)
+        return gates.accept_repair(role, text, st.as_written, data, st.repair_mode or "transcribe", warnings)
+
+    async def _complete_coverage(self, spec: AgentSpec, text: str, st: gates.Structured,
+                                 expected: set[str]) -> tuple[gates.Structured, list[str]]:
+        """Every expected ID classified exactly once. Repeats with one severity merge for free; IDs left out, or
+        given two severities, go to one targeted supplement call on the agent's own model, whose rulings replace
+        them in its data (and whose reasoning is appended to its report)."""
+        list_key, key = gates.coverage_keys(spec.role)
+        entries = [e for e in st.data.get(list_key) or [] if isinstance(e, dict)]
+        status = gates.coverage_status(entries, key, expected)
+        notes = []
+        if status["repeated"]:
+            entries = gates.drop_ids(entries, key, set(status["repeated"]), keep_first=True)
+            notes.append("classified twice with the same severity (merged): " + ", ".join(status["repeated"]))
+        wanted = sorted(set(status["missing"]) | set(status["conflicts"]))
+        if wanted and self.cfg.gates.coverage_supplement.enabled:
+            sup = await self._supplement(spec, text, wanted, status["conflicts"])
+            if sup is not None:
+                entries = gates.drop_ids(entries, key, set(sup["ids"])) + list(sup["entries"])
+                notes += ["ruled on in a coverage supplement: " + ", ".join(sup["ids"])] + list(sup.get("warnings") or [])
+        if not notes:
+            return st, []
+        return dataclasses.replace(st, data={**st.data, list_key: entries}, warnings=st.warnings + notes), notes
+
+    async def _supplement(self, spec: AgentSpec, text: str, wanted: list[str], conflicts: dict) -> dict | None:
+        """One call on the agent's own model and effort that rules on exactly `wanted`, seeing only the reports
+        that raised them and its own report. Its record (with the accepted rulings) lives in the gate sidecar."""
+        aid, role = spec.agent_id, spec.role
+        scfg = self.cfg.gates.coverage_supplement
+        gate_path = self.store.gate_path(aid, role)
+        gate = read_json(gate_path) or {}
+        rec = gate.setdefault("supplement", {"attempts": 0, "outcome": None})
+        if rec.get("outcome") == "accepted":
+            self._append_supplement(spec, rec)  # a crash may have come between accepting it and writing it
+            return rec
+        if rec.get("outcome") in ("rejected", "failed"):
+            return None
+        noun = "objections" if role == "judge" else "follow-up items"
+        asks = [f"- {i}: " + (f"you gave it {' and '.join(SEVERITY_LABEL.get(x, str(x)) for x in dict.fromkeys(conflicts[i]))}"
+                              "; give it one ruling" if i in conflicts else "not classified in your report")
+                for i in wanted]
+        sup_prompt = load_prompt(scfg.prompt)
+        request = sup_prompt.render({"agent_id": aid, "noun": noun, "ids": "\n".join(asks),
+                                     "shape": gates.json_shape(load_prompt(spec.prompt_name).body)})
+        state = self.store.load_state()
+        ctx = ContextBuilder(self.store, self.cfg, self.registry).build_supplement(spec, state, wanted, text, request)
+        rec.update(ids=wanted, conflicts=conflicts, prompt_version=sup_prompt.name, prompt_sha256=sup_prompt.sha256,
+                   inputs=[f"{m['kind']}:{m.get('agent_id') or m.get('path')}" for m in ctx.manifest])
+        result, problems = await self._side_call(
+            spec, gate, "supplement", model=spec.model_alias, effort=spec.effort, system=ctx.system_prompt,
+            user=ctx.user_text, allowed_text=ctx.allowed_text, timeout_minutes=scfg.timeout_minutes,
+            max_attempts=scfg.max_attempts, detail=f"ruling on {len(wanted)} {noun} the report left open",
+            tools=ctx.tools, pdf_path=ctx.pdf_path, tool_server=ctx.tool_server)
+        if result is None:
+            self.store.event("supplement_failed", agent_id=aid, errors=rec.get("errors", []))
+            return None
+        data, _ = gates.parse_json_strict(result.text)
+        if data is None:
+            data, _ = gates.parse_json_lenient(result.text)
+        entries, rejections, warnings = gates.validate_supplement(role, data, wanted)
+        rejections += problems
+        if rejections:
+            rec.update(outcome="rejected", rejections=rejections)
+            atomic_write_json(gate_path, gate)
+            self.store.event("supplement_rejected", agent_id=aid, rejections=rejections)
+            return None
+        rec.update(outcome="accepted", entries=entries, warnings=warnings,
+                   prose=gates.prose_without_block(result.text))
+        atomic_write_json(gate_path, gate)
+        self._append_supplement(spec, rec)
+        self.store.event("supplement_accepted", agent_id=aid, ids=wanted)
+        return rec
+
+    def _append_supplement(self, spec: AgentSpec, rec: dict) -> None:
+        _, body = read_report(self.store.report_path(spec.agent_id, spec.role))
+        if gates.ADDENDUM in body:
+            return
+        noun = "objections" if spec.role == "judge" else "items"
+        addendum = (f"{gates.ADDENDUM}\n## Coverage supplement (requested by the orchestrator)\n\n"
+                    f"{spec.agent_id}'s report left these {noun} unclassified or gave them two severities: "
+                    f"{', '.join(rec['ids'])}. The orchestrator asked the same model to rule on exactly these, "
+                    "showing it only the reports that raised them; its rulings replace any earlier ones for these "
+                    f"IDs.\n\n{rec.get('prose') or ''}")
+        self._rewrite_report(spec, strip_marker(body).rstrip() + "\n\n" + addendum, "coverage supplement appended")
+
+    def _flagged_for(self, spec: AgentSpec) -> list[str]:
+        """Objections (and, for a revised memo, follow-up items) the evidence gates did not find shown."""
+        flagged = set((read_json(self.store.role_dir("judge") / "evidence_gate.json", {}) or {}).get("flagged_ids")
+                      or [])
+        if spec.role == "revision":
+            for k in range(1, int(spec.round or 0) + 1):
+                fm = read_json(followup.round_dir(self.store, k) / "followup_matrix.json", {}) or {}
+                flagged |= set((fm.get("gate") or {}).get("flagged_ids") or [])
+        return sorted(flagged)
+
+    async def _placement_fix(self, spec: AgentSpec, text: str, required: list[tuple[int, str]],
+                             flagged: list[str], problem: gates.Check) -> str:
+        """A memo that lists an unverified threat as surviving, or leaves one out of 'Unverified threats', gets one
+        call on its own model that rewrites only those two sections; the result is spliced in when it passes the
+        same check. Returns the memo text to gate (fixed, or unchanged when no usable fix came back)."""
+        aid, role = spec.agent_id, spec.role
+        pcfg = self.cfg.gates.placement_fix
+        survived, unverified = gates.placement_sections(required)
+        gate_path = self.store.gate_path(aid, role)
+        gate = read_json(gate_path) or {}
+        rec = gate.setdefault("placement_fix", {"attempts": 0, "outcome": None})
+        if rec.get("outcome") == "accepted":
+            fixed = gates.splice_sections(text, rec["sections"], survived, unverified)
+            if fixed is not None and fixed != text:  # a crash came between accepting the fix and writing it
+                self._rewrite_report(spec, fixed, f"sections {survived}-{unverified} rewritten by the placement fix")
+            return fixed or text
+        if rec.get("outcome") in ("rejected", "failed") or not pcfg.enabled or unverified != (survived or 0) + 1:
+            return text
+        titles = dict(required)
+        gate_md = ""
+        gate_file = self.store.role_dir("judge") / "evidence_gate.md"
+        if gate_file.is_file():
+            gate_md = gate_file.read_text(encoding="utf-8")
+        fix_prompt = load_prompt(pcfg.prompt)
+        system = fix_prompt.render({"agent_id": aid, "survived": survived, "unverified": unverified,
+                                    "survived_title": titles[survived], "unverified_title": titles[unverified]})
+        user = (f"<evidence_gate source=\"orchestrator (deterministic)\">\n{gate_md.strip()}\n</evidence_gate>\n\n"
+                f"<placement_check source=\"orchestrator\">\n{problem.message}\nNot shown, so they belong in "
+                f"section {unverified} and may not lead an entry of section {survived}: {', '.join(flagged)}\n"
+                f"</placement_check>\n\n<your_memo agent_id=\"{aid}\">\n{text}\n</your_memo>")
+        rec.update(flagged=flagged, problem=problem.message, prompt_version=fix_prompt.name,
+                   prompt_sha256=fix_prompt.sha256)
+        result, problems = await self._side_call(
+            spec, gate, "placement_fix", model=spec.model_alias, effort=spec.effort, system=system, user=user,
+            allowed_text=text + "\n" + gate_md, timeout_minutes=pcfg.timeout_minutes, max_attempts=pcfg.max_attempts,
+            detail="refiling unverified threats in the memo")
+        if result is None:
+            self.store.event("placement_fix_failed", agent_id=aid, errors=rec.get("errors", []))
+            return text
+        reply = result.text.replace("\r\n", "\n")
+        start = next((s for n, _, s, _ in gates.section_spans(reply) if n == survived), None)
+        sections = gates.prose_without_block(reply[start:]) if start is not None else ""
+        fixed = gates.splice_sections(text, sections, survived, unverified) if sections else None
+        rejections = list(problems)
+        if fixed is None:
+            rejections.append(f"the reply did not consist of exactly sections {survived} and {unverified}")
+        else:
+            got = {n: t for n, t, _, _ in gates.section_spans(sections)}
+            renamed = [n for n in (survived, unverified) if gates._title_key(got.get(n, "")) != gates._title_key(titles[n])]
+            if renamed:
+                rejections.append(f"the reply renamed section(s) {', '.join(map(str, renamed))}")
+            again = gates.check_unverified_placement(fixed, required, flagged, block=True)
+            if again.result != gates.PASS:
+                rejections.append("after the fix: " + again.message)
+            invented = sorted(set(gates._ENTRY_ID.findall(sections)) - set(gates._ENTRY_ID.findall(text)) - set(flagged))
+            if invented:
+                rejections.append(f"the reply cites IDs the memo does not: {', '.join(invented)}")
+        if rejections:
+            rec.update(outcome="rejected", rejections=rejections)
+            atomic_write_json(gate_path, gate)
+            self.store.event("placement_fix_rejected", agent_id=aid, rejections=rejections)
+            return text
+        rec.update(outcome="accepted", sections=sections)
+        atomic_write_json(gate_path, gate)
+        self._rewrite_report(spec, fixed, f"sections {survived}-{unverified} rewritten by the placement fix")
+        self.store.event("placement_fixed", agent_id=aid, flagged=flagged)
+        return fixed
+
+    def _rewrite_report(self, spec: AgentSpec, text: str, reason: str) -> None:
+        """Edit a gated report in place (a coverage supplement or a placement fix): the replaced version is
+        archived, the front matter records the edit, and the agent's marker and fingerprint follow the new text."""
+        path = self.store.report_path(spec.agent_id, spec.role)
+        meta, body = read_report(path)
+        m = re.match(r"<!-- aid:[A-Z0-9]+:[0-9a-f]{12} -->", body)
+        marker = m.group(0) if m else new_marker(spec.agent_id)
+        self.store.archive_copy(path, spec.agent_id, spec.role, reason)
+        meta["orchestrator_edits"] = list(meta.get("orchestrator_edits") or []) + [{"at": utcnow_iso(), "edit": reason}]
+        write_report(path, meta, text, marker)
+        _, new_body = read_report(path)
+        self.guard.register(spec.agent_id, spec.role, marker, new_body, self._exclusions(),
+                            position(spec.role, spec.round))
+
+    async def _side_call(self, spec: AgentSpec, gate: dict, key: str, *, model: str, effort: str, system: str,
+                         user: str, allowed_text: str, timeout_minutes: float, max_attempts: int, detail: str,
+                         tools: list[str] | None = None, pdf_path: Path | None = None,
+                         tool_server: dict | None = None) -> tuple[AgentResult | None, list[str]]:
+        """A model call the gate makes for an agent (format repair, coverage supplement, placement fix), with an
+        agent's guard, retries, plan-limit waits, usage records and isolation audit. Its record is gate[key] in
+        the agent's gate sidecar, written before every call, so a resume never pays twice for a decided call.
+        Returns (result, problems), where problems are a failed audit or another model answering; (None, errors)
+        after a permanent refusal. Raises GateInterrupted to leave the agent `gating` for a resume."""
+        aid, role = spec.agent_id, spec.role
+        gate_path = self.store.gate_path(aid, role)
+        rec = gate.setdefault(key, {"attempts": 0, "outcome": None})
+        pos = position(role, spec.round)
+        self.guard.check_prompt(role, aid, system + "\n" + user, allowed_text=allowed_text, pos=pos)
         self.guard.check_secrets(aid, system + "\n" + user)
-        rep.update(model_requested=info.id, effort=rcfg.effort, mode=st.repair_mode, prompt_version=repair_prompt.name,
-                   prompt_sha256=repair_prompt.sha256)
+        info = self.registry.resolve(model)
+        rec.update(model_requested=info.id, effort=effort)
         rc = self.cfg.retry
         transient = 0
         attempt = int(gate.get("attempt") or 1)
         while True:
-            if transient >= rcfg.max_attempts:  # an outage, not a verdict: stay `gating`, retry on resume
-                rep["transient_exhausted"] = int(rep.get("transient_exhausted") or 0) + 1
+            if transient >= max_attempts:  # an outage, not a verdict: stay `gating`, retry on resume
+                rec["transient_exhausted"] = int(rec.get("transient_exhausted") or 0) + 1
                 atomic_write_json(gate_path, gate)
-                self._set(aid, detail="the format-repair call keeps failing for transient reasons; resume to retry")
+                self._set(aid, detail=f"{detail}: the call keeps failing for transient reasons; resume to retry")
                 raise GateInterrupted()
             started = time.monotonic()
             try:
@@ -891,19 +1118,20 @@ class Pipeline:
                     await self._stagger()
                     if self.cancel.is_set() or self.fatal:
                         raise GateInterrupted()
-                    rep["attempts"] = int(rep.get("attempts") or 0) + 1  # counted only when a call is made
+                    rec["attempts"] = int(rec.get("attempts") or 0) + 1  # counted only when a call is made
                     atomic_write_json(gate_path, gate)
-                    log_dir = self.store.agent_log_dir(aid) / f"attempt-{attempt}" / f"repair-{rep['attempts']}"
-                    req = AgentRequest(run_id=self.store.run_id, agent_id=f"{aid}-repair", role="repair",
-                                       model=info.id, effort=rcfg.effort, system_prompt=system, user_text=user,
-                                       log_dir=log_dir, timeout_s=rcfg.timeout_minutes * 60,
+                    log_dir = self.store.agent_log_dir(aid) / f"attempt-{attempt}" / f"{key}-{rec['attempts']}"
+                    req = AgentRequest(run_id=self.store.run_id, agent_id=f"{aid}-{key}", role=key, model=info.id,
+                                       effort=effort, system_prompt=system, user_text=user, log_dir=log_dir,
+                                       tools=list(tools or []), pdf_path=pdf_path, tool_server=tool_server,
+                                       timeout_s=timeout_minutes * 60,
                                        idle_timeout_s=self.cfg.provider.idle_timeout_minutes * 60,
                                        max_output_tokens=info.max_output_tokens)
-                    self._set(aid, detail=f"repairing the structured block (call {rep['attempts']})")
+                    self._set(aid, detail=f"{detail} (call {rec['attempts']})")
                     result = await self.provider.run(req, self.cancel)
             except ProviderError as err:
-                self._record_usage(spec, attempt, None, err, time.monotonic() - started, stage="repair",
-                                   model=info.id, effort=rcfg.effort)
+                self._record_usage(spec, attempt, None, err, time.monotonic() - started, stage=key,
+                                   model=info.id, effort=effort)
                 if err.kind is ErrorKind.CANCELLED or self.cancel.is_set():
                     raise GateInterrupted() from err
                 if err.kind in RUN_FATAL:
@@ -914,40 +1142,27 @@ class Pipeline:
                     if await self._wait_plan_limit(None, err.message, err.reset_at) is None:
                         raise GateInterrupted() from err
                     continue
-                rep.setdefault("errors", []).append(f"{err.kind.value}: {err.message[:200]}")
+                rec.setdefault("errors", []).append(f"{err.kind.value}: {err.message[:200]}")
                 atomic_write_json(gate_path, gate)
-                if not err.retryable:  # a permanent refusal: fall back now
-                    rep.update(outcome="failed")
+                if not err.retryable:  # a permanent refusal: the caller falls back now
+                    rec.update(outcome="failed")
                     atomic_write_json(gate_path, gate)
-                    self.store.event("repair_failed", agent_id=aid, errors=rep.get("errors", []))
-                    return gates.fallback(role, text, st.as_written, fallback_note)
+                    return None, rec["errors"][-1:]
                 transient += 1
                 await self._sleep(min(rc.max_delay_seconds, rc.base_delay_seconds * 2 ** (transient - 1)))
                 if self.cancel.is_set():
                     raise GateInterrupted() from err
                 continue
-            self._record_usage(spec, attempt, result, None, (result.duration_ms or 0) / 1000, stage="repair",
-                               model=info.id, effort=rcfg.effort)
-            audit = self.guard.audit(role, aid, result.transcript_path, result.sandbox_dir, result.text,
-                                     pos=position(role, spec.round))
+            self._record_usage(spec, attempt, result, None, (result.duration_ms or 0) / 1000, stage=key,
+                               model=info.id, effort=effort)
+            audit = self.guard.audit(role, aid, result.transcript_path, result.sandbox_dir, result.text, pos=pos)
             self.provider.cleanup(result)
-            data, rejections, warnings = gates.validate_repair(role, st.repair_mode or "transcribe", result.text,
-                                                               text, st.broken_block)
-            if audit["status"] != "pass":
-                rejections.append(f"the repair call's isolation audit was {audit['status']}")
+            problems = [] if audit["status"] == "pass" else [f"the call's isolation audit was {audit['status']}"]
             other = gates.check_substitution(info.id, result.served_models, "block")
             if other.result != gates.PASS:
-                rejections.append(other.message)
-            rep.update(served_by=result.served_models, log_dir=self.store.rel(log_dir))
-            if rejections or data is None:
-                rep.update(outcome="rejected", rejections=rejections)
-                atomic_write_json(gate_path, gate)
-                self.store.event("repair_rejected", agent_id=aid, rejections=rejections)
-                return gates.fallback(role, text, st.as_written, fallback_note)
-            rep.update(outcome="accepted")
-            atomic_write_json(gate_path, gate)
-            self.store.event("repair_accepted", agent_id=aid, mode=st.repair_mode)
-            return gates.accept_repair(role, text, st.as_written, data, st.repair_mode or "transcribe", warnings)
+                problems.append(other.message)
+            rec.update(served_by=result.served_models, log_dir=self.store.rel(log_dir))
+            return result, problems
 
     def _calibrate(self, result: AgentResult, ctx: BuiltContext) -> None:
         usage = result.usage or {}
@@ -1238,10 +1453,16 @@ class Pipeline:
                         f"rerun {critic_id} first (rerun_agents=['{critic_id}'])"}
         record = followup.triage(self.store, self.cfg, state, r)
         if fresh:
-            if not followup.routable(record):
-                self._round(r, status="complete", outcome="nothing_to_follow_up", critic=critic_id)
-                self.store.event("followup_round_skipped", round=r, reason="no item to adjudicate or verify")
-                return {"outcome": "nothing_to_follow_up", "round": r}
+            if not followup.routable(record):  # the review stops here; how ready it is still needs saying
+                issues = followup.open_issues(self.store, state)
+                outcome = followup.SATURATED if issues["blocking"] else followup.READY
+                atomic_write_json(followup.round_dir(self.store, r) / "round.json", {
+                    "round": r, "recheck": None, "outcome": outcome, "reason": "nothing_to_follow_up",
+                    "new_items": [], "disputed_repeats": [], "open_issues": issues, "decided_at": utcnow_iso()})
+                self._round(r, status="complete", outcome=outcome, reason="nothing_to_follow_up", critic=critic_id)
+                self.store.event("followup_round_skipped", round=r, reason="no item to adjudicate or verify",
+                                 outcome=outcome)
+                return {"outcome": outcome, "round": r, "reason": "nothing_to_follow_up"}
             specs = followup.plan_agents(self.cfg, self.registry, state, r)
             revision = next(s.agent_id for s in specs if s.role == "revision")
             recheck = next(s.agent_id for s in specs if s.role == "recheck")

@@ -7,13 +7,13 @@ from pathlib import Path
 import yaml
 
 from conftest import mock_override
-from paper_adversary import service
+from paper_adversary import gates, service
 from paper_adversary.config import FullTextConfig
 from paper_adversary.pipeline import Pipeline
 from paper_adversary.reports import read_report
 from paper_adversary.search.fulltext import FullTextResult, FullTextStore
 from paper_adversary.store import RunStore
-from paper_adversary.util import read_json, runs_root, sha256_text
+from paper_adversary.util import read_json, read_jsonl, runs_root, sha256_text
 from paper_adversary.ingest import ingest_markdown
 from paper_adversary.passages import SourceText
 from paper_adversary.verification import _locate, pending_requests
@@ -116,11 +116,26 @@ def test_verified_quotes_blind_verifier_and_the_evidence_gate(runs_dir, sample_p
     assert "<evidence_gate" in synthesis_prompt
 
 
-def test_misplaced_unverified_threats_are_flagged(runs_dir, sample_paper):
+def test_misplaced_unverified_threats_are_sent_back(runs_dir, sample_paper):
     store = _create(sample_paper, decisive={"N2": DECISIVE["N2"]}, misplace={"S1": True})
     _run(store)
     s1 = store.load_state()["agents"]["S1"]
-    assert any("listed as surviving criticisms" in w and "N2-O1" in w for w in s1["gate"]["warnings"])
+    assert s1["status"] == "complete"
+    assert any("rewritten by a placement fix" in w and "N2-O1" in w for w in s1["gate"]["warnings"])
+    assert read_json(store.gate_path("S1", "synthesis"))["placement_fix"]["outcome"] == "accepted"
+    meta, body = read_report(store.report_path("S1", "synthesis"))
+    assert "N2-O1" in gates.section_text(body, 6) and "N2-O1" not in gates.lead_ids(gates.section_text(body, 5))
+    assert meta["orchestrator_edits"] and "CANARY_S1" in body  # the rest of the memo is untouched
+    assert any("placement fix" in e.get("reason", "") for e in read_jsonl(store.dir / "archive" / "index.jsonl"))
+    critic_prompt = (store.dir / "logs/agents/C1/attempt-1/user_prompt.md").read_text()
+    assert "Mock (fixed)." in critic_prompt  # later stages read the fixed memo
+    for mode in ("unchanged", "renamed", "invent", "fail:invalid_request"):
+        store = _create(sample_paper, decisive={"N2": DECISIVE["N2"]}, misplace={"S1": True},
+                        placement_fix={"S1": mode})
+        result, _ = _run(store)
+        s1 = store.load_state()["agents"]["S1"]
+        assert s1["status"] == "quarantined" and "surviving criticisms" in s1["detail"], mode
+        assert result["outcome"] == "quarantined", mode
 
 
 def test_no_decisive_objections_skips_verification(runs_dir, sample_paper):

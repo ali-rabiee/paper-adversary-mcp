@@ -34,7 +34,10 @@ get_run_status(run_id, wait_seconds=50). A full review takes tens of minutes. Re
 time with get_report instead of pulling the whole run into the conversation.
 
 After the completeness critic, follow-up rounds (run_followup) verify, adjudicate and fold the critic's items
-into a revised memo; get_report(run_id, "memo") is always the current memo.
+into a revised memo; get_report(run_id, "memo") is always the current memo. A finished review is labelled
+ready_for_next_gate only when nothing serious is open (no standing FATAL verdict, no unverified FATAL prior-work
+threat, no item the re-check critic re-raised); otherwise review_saturated_with_open_issues, with the list in
+get_run_status.
 
 Every agent's output passes completion gates (isolation audit, structured data, truncation, model,
 coverage). An output that fails is quarantined: kept on disk, never read by later stages. Only call

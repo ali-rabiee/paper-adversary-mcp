@@ -79,7 +79,7 @@ def test_judgment_matrix_flags(runs_dir, sample_paper):
     _run(store)
     matrix = service.get_report(store.run_id, "matrix")
     assert "contested" in matrix  # J1 MAJOR vs J2 FATAL/NOT CONVINCING on O2 objections
-    assert "not classified by J3" in matrix  # J3 skips second objections
+    assert "not classified by" not in matrix  # J3 skipped the second objections; a supplement ruled on them
     assert "N1-O1" in matrix and "F3-O2" in matrix
 
 

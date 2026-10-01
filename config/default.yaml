@@ -70,7 +70,7 @@ synthesis:
   model: fable-5.1
   effort: max
   agents: 1
-  prompt: synthesis_v2   # v2: section 6 "Unverified threats — check before acting"
+  prompt: synthesis_v3   # v3: entries of sections 5-6 lead with their IDs (checked; misfiled threats are sent back)
   tools: []
   paper_format: text
   timeout_minutes: 90
@@ -99,7 +99,7 @@ followup:                # after the critic: verify its items, two blind adjudic
   revision:
     model: fable-5.1
     effort: max
-    prompt: synthesis_revision_v1
+    prompt: synthesis_revision_v2
     timeout_minutes: 90
   recheck:
     model: fable-5.1
@@ -195,8 +195,18 @@ gates:                   # checks every agent's output must pass before later st
     model_repair: true         # missing/invalid JSON: free fixes first, then a repair call for these roles
     repair_first: [intake, novelty]
   judge_coverage:
-    min_fraction: 0.5          # a judge classifying fewer objections than this is quarantined
+    min_fraction: 1.0          # every objection (adjudicators: every routed item) classified, after a supplement
     objection_index: true      # list every objection ID in each judge's assignment
+  coverage_supplement:         # IDs a judge or adjudicator left out, or gave two severities: one targeted call on
+    enabled: true              # its own model, seeing only the reports that raised them; still incomplete -> quarantine
+    prompt: coverage_supplement_v1
+    timeout_minutes: 45
+    max_attempts: 2
+  placement_fix:               # a memo that lists an unverified threat as surviving, or leaves it out of
+    enabled: true              # 'Unverified threats': one call on its own model rewriting only those two sections,
+    prompt: placement_fix_v1   # spliced in and re-checked; still wrong -> quarantine
+    timeout_minutes: 45
+    max_attempts: 2
   sections:
     synthesis: block_incomplete   # block_any | block_incomplete | warn
     critic: warn
