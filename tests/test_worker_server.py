@@ -72,7 +72,8 @@ def test_mcp_tools_end_to_end(runs_dir, sample_paper):
     tools = {t.name for t in asyncio.run(server.mcp.list_tools())}
     assert {"create_review_run", "run_refuters", "run_judges", "run_synthesis", "run_completeness_critic",
             "run_full_review", "get_run_status", "get_report", "get_run_cost", "resume_run", "cancel_run",
-            "list_runs", "validate_config"} <= tools
+            "list_runs", "validate_config", "release_quarantine", "run_verification", "add_prior_fulltext",
+            "run_followup"} <= tools
 
     created = call("create_review_run", paper_path=str(sample_paper), venue="ICML 2027",
                    config_override=mock_override())

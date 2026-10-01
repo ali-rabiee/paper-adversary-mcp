@@ -53,7 +53,7 @@ def _units(sections: list[Section]) -> list[Section]:
 
 
 def plan_document(text: str, sections: list[Section], budget_tokens: int, priorities: list[str],
-                  tokens_per_char: float) -> DocPlan:
+                  tokens_per_char: float, tool_call: str = 'read_paper_section("{id}")') -> DocPlan:
     full = estimate_tokens(text, tokens_per_char)
     if full <= budget_tokens:
         return DocPlan("full", text, [s.id for s in sections], [], full, full, budget_tokens)
@@ -90,7 +90,7 @@ def plan_document(text: str, sections: list[Section], budget_tokens: int, priori
                         "page_start": s.page_start, "page_end": s.page_end})
         parts.append(
             f"\n> [Section {s.id} \"{s.title}\" ({s.kind}{pages}, ~{est:,} tokens) is not shown inline. "
-            f"Call read_paper_section(\"{s.id}\") to read it in full.]\n\n"
+            f"Call {tool_call.format(id=s.id)} to read it in full.]\n\n"
         )
     inline_text = "".join(parts)
     return DocPlan("sectioned", inline_text, sorted(chosen), omitted,

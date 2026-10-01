@@ -124,6 +124,14 @@ def _k(n: int) -> str:
     return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
 
 
+def phase_label(stage: str) -> str:
+    """'round1:adjudicator' -> 'Round 1 · Adjudicators'; base stages by their label."""
+    if stage.startswith("round") and ":" in stage:
+        rnd, role = stage.split(":", 1)
+        return f"Round {rnd.removeprefix('round')} · {STAGE_LABEL.get(role, role)}"
+    return STAGE_LABEL.get(stage, stage)
+
+
 def cost_markdown(run_id: str, summary: dict, provider: str) -> str:
     rows = [
         f"Run: {run_id} — usage and cost by phase",
@@ -147,7 +155,7 @@ def cost_markdown(run_id: str, summary: dict, provider: str) -> str:
                 f"{fmt_duration(b['agent_seconds'])} |")
 
     for stage, b in summary["phases"].items():
-        rows.append(line(STAGE_LABEL.get(stage, stage), b))
+        rows.append(line(phase_label(stage), b))
     rows.append(line("**Total**", summary["total"]))
     total = summary["total"]
     notes = []

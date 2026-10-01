@@ -2,8 +2,9 @@
 
 import pytest
 
+from conftest import FAKE_SECRETS
 from paper_adversary.budget import BudgetError, plan_document
-from paper_adversary.ingest import ingest
+from paper_adversary.ingest import IngestError, ingest
 
 
 def _kinds(result):
@@ -161,3 +162,23 @@ def test_pdf_real_world_layout_quirks(tmp_path):
     assert "1 Introduction" in titles and "2 Method" in titles and "2 Components" not in titles
     assert r.abstract and r.abstract.startswith("We study something important")
     assert [x["text"][:10] for x in r.references] == ["Ho, J. and", "Ho, J., Ja", "Song, Y. a"]
+
+
+def test_ingest_refuses_hidden_files_bare_files_and_credentials(tmp_path):
+    hidden = tmp_path / ".config" / "paper.md"
+    hidden.parent.mkdir()
+    hidden.write_text("# A paper\n\nText.\n")
+    with pytest.raises(IngestError, match="hidden"):
+        ingest(hidden)
+    bare = tmp_path / "credentials"  # no extension: never read as text
+    bare.write_text("# Notes\n\nsome text\n")
+    with pytest.raises(IngestError, match="unsupported file type"):
+        ingest(bare)
+    leaky = tmp_path / "draft.md"
+    leaky.write_text("# Draft\n\nSetup: S2_API_KEY=" + FAKE_SECRETS["s2"] + "\n" + "Body text. " * 50)
+    with pytest.raises(IngestError, match="credentials"):
+        ingest(leaky)
+    placeholder = tmp_path / "tooling.md"  # a paper about LLM tooling may print placeholders
+    placeholder.write_text("# Agents\n\nRun `export ANTHROPIC_API_KEY=sk-ant-api03-XXXXXXXXXXXXXXXXXXXXXXXX`.\n"
+                           + "Body text. " * 50)
+    assert ingest(placeholder).text_md

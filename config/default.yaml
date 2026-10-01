@@ -18,9 +18,9 @@ novelty:
   model: opus-5.5
   effort: high
   agents: 4
-  prompt: novelty_v1
+  prompt: novelty_v2     # v2: decisive overlaps must be shown with verbatim full-text passages
   lenses: true           # give each agent a different primary focus (see prompts/lenses_v1.yaml)
-  tools: [web_search, web_fetch, literature]
+  tools: [web_search, web_fetch, literature, prior_text]
   paper_format: text
   timeout_minutes: 75
 
@@ -44,11 +44,23 @@ fit:
   paper_format: text
   timeout_minutes: 60
 
+verifier:                # blind verifiers: one per cited prior paper behind a decisive novelty objection
+  enabled: true
+  model: opus-5.5
+  effort: high
+  prompt: verifier_v1
+  tools: [prior_text]    # scoped: only the paper it was given, read from this run's snapshot, no network
+  paper_format: text
+  timeout_minutes: 45
+  max_agents_per_batch: 4
+  max_agents_per_run: 8
+  blocking: false        # judges proceed; a missing verification becomes an evidence-gate label
+
 judge:
   model: fable-5.1
   effort: max
   agents: 3
-  prompt: judge_v1
+  prompt: judge_v2
   lenses: false          # judges get identical instructions; independence comes from isolation
   tools: []
   paper_format: pdf
@@ -58,7 +70,7 @@ synthesis:
   model: fable-5.1
   effort: max
   agents: 1
-  prompt: synthesis_v1
+  prompt: synthesis_v2   # v2: section 6 "Unverified threats — check before acting"
   tools: []
   paper_format: text
   timeout_minutes: 90
@@ -67,10 +79,33 @@ critic:
   model: fable-5.1
   effort: xhigh
   agents: 1
-  prompt: critic_v1
+  prompt: critic_v2      # v2: every finding is also a typed item for the follow-up round
   tools: []
   paper_format: text
   timeout_minutes: 90
+
+followup:                # after the critic: verify its items, two blind adjudicators, a revised memo, a re-check
+  auto_start: true       # run_full_review starts round 1 when the critic raises an item at min_severity or above
+  auto_continue: true    # the next round starts when the re-check finds new items, up to max_rounds
+  max_rounds: 2          # per run, these may only be lowered or switched off
+  min_severity: MAJOR_FIXABLE   # items below this are noted in the revised memo without adjudication
+  adjudicators: 2
+  adjudicator:
+    model: fable-5.1
+    effort: max
+    prompt: adjudicator_v1
+    paper_format: pdf
+    timeout_minutes: 90
+  revision:
+    model: fable-5.1
+    effort: max
+    prompt: synthesis_revision_v1
+    timeout_minutes: 90
+  recheck:
+    model: fable-5.1
+    effort: xhigh
+    prompt: critic_recheck_v1
+    timeout_minutes: 90
 
 rubric: default_v1       # prompts/rubrics/<name>.md, or pass rubric text/path per run
 lens_set: lenses_v1      # prompts/<lens_set>.yaml
@@ -110,6 +145,27 @@ search:
   refcheck_max_refs: 60
   web_search: true
   web_fetch: true
+  fulltext:              # open full texts of prior work, so quotes can be checked verbatim
+    enabled: true
+    host_policy: allowlist   # allowlist (arXiv + open ML proceedings + PMC) | arxiv_only; not settable per run
+    allow_hosts: []          # extra hosts to allow; not settable per run
+    max_pdf_mb: 30
+    max_html_mb: 10
+    max_pages: 80
+    extract_timeout_seconds: 180
+    arxiv_document_interval_seconds: 15   # arxiv.org robots.txt crawl-delay
+    host_interval_seconds: 2
+    ttl_days: 90
+    negative_ttl_days: 3
+    offline: false
+
+evidence:                # when a FATAL/MAJOR verdict on prior work counts as shown (evidence gate); not settable per run
+  require_independent_check: true   # a blind verifier who finds the anticipation, with its own quotes verified
+                                    # (false: the refuter's verified quotes suffice; also used when no verifier runs)
+  accept_approximate_score: 1.01    # >1 = only verbatim quotes count; e.g. 0.95 also accepts near-verbatim ones
+  min_prior_words: 12
+  min_submission_words: 8
+  max_words: 80
 
 budget:
   chars_per_token: 3.2   # conservative heuristic; replaced by a calibrated ratio once agents report usage
@@ -121,5 +177,32 @@ budget:
     default: [title, abstract, introduction, method, theory, experiments, results, limitations, conclusion, related_work, references, appendix, other]
     intake: [title, abstract, introduction, method, theory, experiments, results, limitations, conclusion, related_work, appendix, other, references]
     novelty: [title, abstract, introduction, related_work, references, method, conclusion, experiments, results, limitations, theory, appendix, other]
+    verifier: [title, abstract, introduction, method, theory, results, experiments, conclusion, related_work, limitations, appendix, other, references]
+    prior: [title, abstract, introduction, method, theory, experiments, results, related_work, conclusion, limitations, appendix, other, references]
     rigor: [title, abstract, method, theory, experiments, results, introduction, limitations, appendix, conclusion, related_work, other, references]
     fit: [title, abstract, experiments, results, method, introduction, limitations, appendix, conclusion, theory, related_work, other, references]
+
+gates:                   # checks every agent's output must pass before later stages may read it
+  # Only gates.repair.model / effort / timeout_minutes may be changed per run (config_override);
+  # everything else here can be set only in this file or in $PAPER_ADVERSARY_CONFIG.
+  audit:
+    unverifiable: quarantine   # quarantine | warn  (a failed audit always quarantines)
+    auto_rerun: 1              # fresh reruns per agent after a failed or unverifiable audit (0 or 1)
+    max_auto_reruns_per_job: 2
+  model_substitution: block    # block | warn: another model answered than the one configured
+  truncation: block            # block | warn: report cut at the output-token limit (warn if its JSON is intact)
+  structured:
+    model_repair: true         # missing/invalid JSON: free fixes first, then a repair call for these roles
+    repair_first: [intake, novelty]
+  judge_coverage:
+    min_fraction: 0.5          # a judge classifying fewer objections than this is quarantined
+    objection_index: true      # list every objection ID in each judge's assignment
+  sections:
+    synthesis: block_incomplete   # block_any | block_incomplete | warn
+    critic: warn
+  repair:                      # format-repair call: transcribes a report into JSON; validated, never adds content
+    model: opus-5.5
+    effort: low
+    prompt: repair_v1
+    timeout_minutes: 10
+    max_attempts: 2

@@ -41,6 +41,10 @@ def main(argv: list[str] | None = None) -> int:
         from paper_adversary.tools_server import main as tools_main
 
         return tools_main(argv[1:])
+    if argv[:1] == ["extract-fulltext"]:
+        from paper_adversary.search.extract import extract_main
+
+        return extract_main(argv[1:])
     load_dotenv_into_environ()
     parser = argparse.ArgumentParser(prog="paper-adversary", description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -84,7 +88,19 @@ def main(argv: list[str] | None = None) -> int:
         if name in ("synthesis", "critic"):
             p.add_argument("--rerun", action="store_true")
         if name == "resume":
-            p.add_argument("--through", default="critic", choices=["refuters", "judges", "synthesis", "critic"])
+            p.add_argument("--through", default="critic",
+                           choices=["refuters", "judges", "synthesis", "critic", "followup"])
+    fu = sub.add_parser("followup", help="run the follow-up of the completeness critique (verify, adjudicate, "
+                        "revise the memo, re-check)")
+    fu.add_argument("run")
+    fu.add_argument("--dry-run", action="store_true", help="only show what the next round would do")
+    fu.add_argument("--rerun", default="", help="comma-separated follow-up agent IDs to redo")
+    fu.add_argument("--foreground", action="store_true")
+    fu.add_argument("--wait", type=float, default=0)
+    vf = sub.add_parser("verify", help="re-check the evidence gate's unconfirmed verdicts with blind verifiers")
+    vf.add_argument("run")
+    vf.add_argument("--foreground", action="store_true")
+    vf.add_argument("--wait", type=float, default=0)
 
     s = sub.add_parser("status", help="show run status")
     s.add_argument("run")
@@ -94,6 +110,7 @@ def main(argv: list[str] | None = None) -> int:
     rp.add_argument("--agent")
     rp.add_argument("--offset", type=int, default=0)
     rp.add_argument("--max-chars", type=int, default=200000)
+    rp.add_argument("--round", type=int, default=None, help="follow-up round for items / followup_matrix")
     co = sub.add_parser("cost", help="usage and cost by phase")
     co.add_argument("run")
     sub.add_parser("list", help="list runs")
@@ -101,6 +118,11 @@ def main(argv: list[str] | None = None) -> int:
     ca.add_argument("run")
     d = sub.add_parser("desktop-config", help="print (or --install) the Claude Desktop MCP server entry")
     d.add_argument("--install", action="store_true", help="merge it into Claude Desktop's config (a backup is kept)")
+    rel = sub.add_parser("release", help="release a quarantined agent output, with a recorded reason")
+    rel.add_argument("run")
+    rel.add_argument("agent")
+    rel.add_argument("--reason", required=True, help="why the gate's finding does not hold")
+    rel.add_argument("--yes", action="store_true", help="skip the interactive confirmation")
     v = sub.add_parser("validate", help="check config, CLI and login; --probe to test each model")
     v.add_argument("--config")
     v.add_argument("--probe", action="store_true")
@@ -128,8 +150,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "create":
             return 0
         store = RunStore.open(info["run_id"])
-        stages = sorted({a["role"] for a in info["agents"]},
-                        key=["intake", "novelty", "rigor", "fit", "judge", "synthesis", "critic"].index)
+        stages = service.full_review_stages(store, info)
         return _launch_or_run(store, stages, [], False, args.foreground, args.wait)
     if args.cmd in ("refuters", "judges", "synthesis", "critic", "resume"):
         store = RunStore.open(args.run)
@@ -143,19 +164,27 @@ def main(argv: list[str] | None = None) -> int:
             stages = [args.cmd]
             rerun = [a for a, v in state["agents"].items() if v["role"] == args.cmd] if args.rerun else []
         else:
-            order = ["intake", "novelty", "rigor", "fit", "judge", "synthesis", "critic"]
-            last = {"refuters": "fit", "judges": "judge", "synthesis": "synthesis", "critic": "critic"}[args.through]
-            stages = [x for x in order[: order.index(last) + 1]
-                      if any(a["role"] == x and a["status"] != "complete" for a in state["agents"].values())]
-            rerun = []
+            stages, rerun = service.resume_stages(state, args.through), []
             if not stages:
-                print("Nothing to resume.")
+                print("Nothing to resume: every agent through that stage is complete or quarantined.")
                 return 0
         return _launch_or_run(store, stages, rerun, args.allow_incomplete, args.foreground, args.wait)
     if args.cmd == "status":
         print(service.status_text(args.run))
     elif args.cmd == "report":
-        print(service.get_report(args.run, args.type, args.agent, args.max_chars, args.offset))
+        print(service.get_report(args.run, args.type, args.agent, args.max_chars, args.offset, args.round))
+    elif args.cmd == "followup":
+        store = RunStore.open(args.run)
+        rerun = service.resolve_followup_rerun(store.load_state(), _split(args.rerun))
+        plan = service.followup_plan(args.run)
+        print(plan)
+        if args.dry_run or (plan.startswith("Nothing") and not rerun):
+            return 0
+        return _launch_or_run(store, ["followup"], rerun, False, args.foreground, args.wait)
+    elif args.cmd == "verify":
+        batch_id, n = service.verification_batch(args.run, True, None)
+        print(f"Verification batch {batch_id}: {n} request(s)")
+        return _launch_or_run(RunStore.open(args.run), [f"verify:{batch_id}"], [], False, args.foreground, args.wait)
     elif args.cmd == "cost":
         print(service.cost_text(args.run))
     elif args.cmd == "list":
@@ -164,6 +193,17 @@ def main(argv: list[str] | None = None) -> int:
         from paper_adversary.worker import cancel
 
         print(cancel(RunStore.open(args.run)))
+    elif args.cmd == "release":
+        store = RunStore.open(args.run)
+        aid = args.agent.strip().upper()
+        print(service.gate_text(store, aid, store.load_state()["agents"].get(aid) or {"role": "?", "status": "?"}))
+        if not args.yes:
+            answer = input(f"\nRelease {aid} so later stages read it? This overrides the gate. Type 'release' to "
+                           "confirm: ")
+            if answer.strip().lower() != "release":
+                print("Not released.")
+                return 1
+        print(service.release_quarantine(args.run, aid, args.reason, "cli"))
     elif args.cmd == "validate":
         print(asyncio.run(service.validate_text(args.config, args.probe)))
     elif args.cmd == "desktop-config":

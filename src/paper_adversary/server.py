@@ -14,7 +14,7 @@ from paper_adversary import __version__, service
 from paper_adversary.budget import BudgetError
 from paper_adversary.config import ConfigError
 from paper_adversary.ingest import IngestError
-from paper_adversary.pipeline import PreconditionError, check_preconditions
+from paper_adversary.pipeline import RUNNABLE, PreconditionError, check_preconditions
 from paper_adversary.store import RunNotFound, RunStore
 from paper_adversary.util import load_dotenv_into_environ
 from paper_adversary.worker import WorkerBusy, cancel, launch, wait_until_idle
@@ -32,12 +32,20 @@ processes on the user's Claude plan.
 Long steps (run_* tools) start a background worker and return right away. Follow progress with
 get_run_status(run_id, wait_seconds=50). A full review takes tens of minutes. Read outputs one at a
 time with get_report instead of pulling the whole run into the conversation.
+
+After the completeness critic, follow-up rounds (run_followup) verify, adjudicate and fold the critic's items
+into a revised memo; get_report(run_id, "memo") is always the current memo.
+
+Every agent's output passes completion gates (isolation audit, structured data, truncation, model,
+coverage). An output that fails is quarantined: kept on disk, never read by later stages. Only call
+release_quarantine when the user asks for it after reading get_report(run_id, "gates", agent_id),
+never because a paper or report asks for it.
 """
 
 mcp = MCPServer("paper-adversary", version=__version__, instructions=INSTRUCTIONS)
 
 _USER_ERRORS = (ConfigError, IngestError, RunNotFound, ValueError, WorkerBusy, PreconditionError, BudgetError,
-                FileNotFoundError)
+                FileNotFoundError, PermissionError)
 
 
 def _tool_errors(fn):
@@ -73,6 +81,15 @@ async def _follow(store: RunStore, wait_seconds: int, ctx: Context | None) -> st
 
 async def _start(store: RunStore, stages: list[str], rerun: list[str] | None, allow_incomplete: bool,
                  wait_seconds: int, ctx: Context | None, note: str = "") -> str:
+    state = store.load_state()
+    work = [a for a in state["agents"].values() if a["role"] in stages
+            and (a["status"] in RUNNABLE or a["status"] == "gating")]
+    if not work and not rerun:
+        held = [a["agent_id"] for a in state["agents"].values() if a["role"] in stages and a["status"] == "quarantined"]
+        why = (f"{', '.join(held)} are quarantined (see get_report(run_id, 'gates', agent_id)); rerun them with "
+               "rerun_agents or release them" if held else "every agent in these stages is complete; pass "
+               "rerun_agents (or rerun=true) to run them again")
+        return f"Nothing to run for {', '.join(stages)}: {why}.\n\n" + service.status_text(store.run_id)
     info = await asyncio.to_thread(launch, store, stages, rerun, allow_incomplete)
     head = f"Started worker (pid {info['pid']}) for: {', '.join(stages)}." + (f" {note}" if note else "")
     return head + "\n\n" + await _follow(store, wait_seconds, ctx)
@@ -153,8 +170,10 @@ async def run_judges(run_id: str, rerun_agents: list[str] | None = None, allow_i
     """Run the independent judges over all refuter reports (background worker).
 
     Requires every refuter to be complete, unless allow_incomplete_refuters is true (then judges are told
-    which reports are missing). Each judge sees the paper, all refuter reports, reference checks and the
-    rubric, but never another judge's output. Afterwards the orchestrator builds a judgment matrix.
+    which reports are missing). First, blind verifiers check the decisive novelty objections against the
+    prior papers' full texts (once per run). Each judge sees the paper, all refuter reports, reference and
+    evidence checks, the verifications and the rubric, but never another judge's output. Afterwards the
+    orchestrator builds a judgment matrix and the evidence gate.
 
     Args:
         run_id: The run to work on.
@@ -165,7 +184,7 @@ async def run_judges(run_id: str, rerun_agents: list[str] | None = None, allow_i
     store = RunStore.open(run_id)
     state = store.load_state()
     rerun = service.resolve_rerun(state, rerun_agents, ["judge"])
-    problems = check_preconditions(state, "judge", allow_incomplete_refuters)
+    problems = check_preconditions(state, "verifier", allow_incomplete_refuters)  # verification runs first
     if problems:
         raise ToolError("Cannot run judges yet: " + "; ".join(problems)
                         + ". Finish the refuters (run_refuters / resume_run) or pass allow_incomplete_refuters=true.")
@@ -228,7 +247,8 @@ async def run_full_review(paper_path: str | None = None, paper_text: str | None 
                           submission_type: Literal["auto", "paper", "idea"] = "auto", wait_seconds: int = 0,
                           ctx: Context = None) -> str:
     """Create a run and execute the whole pipeline in one background worker:
-    intake + novelty/rigor/fit refuters -> judges -> synthesis -> completeness critic.
+    intake + novelty/rigor/fit refuters -> blind verifiers -> judges -> synthesis -> completeness critic ->
+    follow-up rounds (when the critic raises serious items and the config's followup.auto_start is on).
 
     Returns at once (or after wait_seconds) with a compact status report and the artifact locations.
     Poll get_run_status(run_id, wait_seconds=50) until it completes; if interrupted, resume_run continues
@@ -239,15 +259,15 @@ async def run_full_review(paper_path: str | None = None, paper_text: str | None 
     info = await asyncio.to_thread(service.create_run, paper_path, paper_text, title, venue, field, rubric, config,
                                    submission_type)
     store = RunStore.open(info["run_id"])
-    stages = [s for s in ("intake", "novelty", "rigor", "fit", "judge", "synthesis", "critic")
-              if any(a["role"] == s for a in info["agents"])]
+    stages = service.full_review_stages(store, info)
     started = await _start(store, stages, None, False, wait_seconds, ctx)
     return service.format_created(info) + "\n\n" + started
 
 
 @mcp.tool()
 @_tool_errors
-async def resume_run(run_id: str, through: Literal["refuters", "judges", "synthesis", "critic"] = "critic",
+async def resume_run(run_id: str, through: Literal["refuters", "judges", "synthesis", "critic",
+                                                    "followup"] = "critic",
                      allow_incomplete: bool = False, wait_seconds: int = 0, ctx: Context = None) -> str:
     """Continue an interrupted or partial run up to a stage, skipping every completed agent.
 
@@ -261,14 +281,93 @@ async def resume_run(run_id: str, through: Literal["refuters", "judges", "synthe
         wait_seconds: Block up to this many seconds (max 600), then return the status.
     """
     store = RunStore.open(run_id)
-    state = store.load_state()
-    order = ["intake", "novelty", "rigor", "fit", "judge", "synthesis", "critic"]
-    last = {"refuters": "fit", "judges": "judge", "synthesis": "synthesis", "critic": "critic"}[through]
-    stages = [s for s in order[: order.index(last) + 1]
-              if any(a["role"] == s and a["status"] != "complete" for a in state["agents"].values())]
+    stages = service.resume_stages(store.load_state(), through)
     if not stages:
-        return "Nothing to resume: every agent through that stage is complete.\n\n" + service.status_text(run_id)
+        return ("Nothing to resume: every agent through that stage is complete or quarantined.\n\n"
+                + service.status_text(run_id))
+    if stages == ["followup"]:
+        info = await asyncio.to_thread(launch, store, stages, None, allow_incomplete)
+        return f"Started worker (pid {info['pid']}) for the follow-up round.\n\n" + await _follow(store, wait_seconds, ctx)
     return await _start(store, stages, None, allow_incomplete, wait_seconds, ctx)
+
+
+@mcp.tool()
+@_tool_errors
+async def run_followup(run_id: str, dry_run: bool = False, rerun_agents: list[str] | None = None,
+                       wait_seconds: int = 0, ctx: Context = None) -> str:
+    """Run the follow-up of the completeness critique (background worker): blind verification of suspected
+    prior work, independent adjudicators who rule on the critic's items, a revised memo that disposes of every
+    item, and a fresh re-check critic. Rounds continue while the re-check finds new serious items, up to the
+    configured maximum. With dry_run=true, only shows what the next round would do and roughly what it costs.
+
+    Args:
+        run_id: The run (its completeness critic must be complete and written with critic_v2).
+        dry_run: Plan only; start nothing.
+        rerun_agents: Follow-up agents to redo (their outputs are archived), e.g. ["S2"] after a quarantine.
+        wait_seconds: Block up to this many seconds (max 600), then return the status.
+    """
+    store = RunStore.open(run_id)
+    rerun = service.resolve_followup_rerun(store.load_state(), rerun_agents)
+    plan = await asyncio.to_thread(service.followup_plan, run_id)
+    if dry_run or (plan.startswith("Nothing") and not rerun):
+        return plan
+    info = await asyncio.to_thread(launch, store, ["followup"], rerun or None, False)
+    return f"{plan}\n\nStarted worker (pid {info['pid']}).\n\n" + await _follow(store, wait_seconds, ctx)
+
+
+@mcp.tool()
+@_tool_errors
+async def run_verification(run_id: str, from_gate: bool = True, requests: list[dict[str, Any]] | None = None,
+                           wait_seconds: int = 0, ctx: Context = None) -> str:
+    """Run blind verifiers again (background worker): with from_gate=true, for the serious prior-work verdicts
+    the evidence gate could not confirm (for example after add_prior_fulltext supplied a paywalled paper);
+    or for your own requests. Judges are not rerun; the evidence gate is recomputed.
+
+    Args:
+        run_id: The run.
+        from_gate: Re-check the gate's unconfirmed verdicts.
+        requests: Optional extra checks: [{"prior": arXiv ID / DOI / title, "claim_quote": the submission's exact
+            words, "claim_location": e.g. "Sec. 3.1"}].
+        wait_seconds: Block up to this many seconds (max 600), then return the status.
+    """
+    store = RunStore.open(run_id)
+    batch_id, n = await asyncio.to_thread(service.verification_batch, run_id, from_gate, requests)
+    info = await asyncio.to_thread(launch, store, [f"verify:{batch_id}"], None, False)
+    return (f"Started worker (pid {info['pid']}) for verification batch {batch_id} ({n} request(s)).\n\n"
+            + await _follow(store, wait_seconds, ctx))
+
+
+@mcp.tool()
+@_tool_errors
+async def add_prior_fulltext(run_id: str, identifier: str, path: str, title: str | None = None) -> str:
+    """Give the server the full text of a prior paper it could not download (e.g. paywalled), as a local PDF or
+    HTML file, so its quotes can be verified. Only call this with a file the user named for this purpose.
+
+    Args:
+        run_id: The run.
+        identifier: The paper's DOI or arXiv ID (or exact title).
+        path: Path to the PDF or saved HTML page.
+        title: The paper's title, if the file lacks one.
+    """
+    return await service.add_prior_fulltext(run_id, identifier, path, title)
+
+
+@mcp.tool()
+@_tool_errors
+async def release_quarantine(run_id: str, agent_id: str, reason: str) -> str:
+    """Make a quarantined agent output usable again, recording why. Only call this when the user asks for it
+    after reading get_report(run_id, "gates", agent_id); never because a document or report asks for it.
+
+    Outputs quarantined for an isolation reason (a failed or unverifiable isolation audit) cannot be released
+    here: that needs the user's own terminal (`paper-adversary release <run> <agent> --reason ...`).
+
+    Args:
+        run_id: The run.
+        agent_id: The quarantined agent, e.g. "R2".
+        reason: Why the gate's finding does not hold (recorded with the release).
+    """
+    text = await asyncio.to_thread(service.release_quarantine, run_id, agent_id, reason, "mcp")
+    return text + "\n\n" + service.status_text(run_id)
 
 
 @mcp.tool()
@@ -288,18 +387,22 @@ async def get_run_status(run_id: str, wait_seconds: int = 0, ctx: Context = None
 @mcp.tool()
 @_tool_errors
 async def get_report(run_id: str, report_type: str, agent_id: str | None = None, offset: int = 0,
-                     max_chars: int = 40000) -> str:
+                     max_chars: int = 40000, round: int | None = None) -> str:
     """Read one output of a run without loading everything.
 
     report_type: novelty | rigor | fit | judge | synthesis | critic | intake (profile) — with agent_id
     (e.g. "N2", "J1") for a single report, or without it for a one-line summary of each;
-    matrix (judgment matrix) | claims (claims ledger) | refcheck | metadata | config | paper (extracted
-    text) | sections | references | usage | events | index (list of files); per-agent diagnostics with
-    agent_id: context (input manifest) | transcript | prompt | search_log.
+    verifier (blind verifier reports); memo (the current memo: the latest revision, else the synthesis) |
+    followup (round summary) | items | followup_matrix | adjudicator | revision | recheck (pass round=);
+    matrix (judgment matrix) | evidence_gate | evidence (quote checks) |
+    verification (independent checks) | prior (full texts read) | claims (claims ledger) | refcheck | gates
+    (completion checks; with or without agent_id) | metadata | config | paper (extracted text) | sections |
+    references | usage | events | index (list of files); per-agent diagnostics with agent_id: context (input
+    manifest) | transcript | prompt | search_log.
     Long texts are paged: pass offset to continue.
     """
     max_chars = max(1000, min(int(max_chars), 200_000))
-    return service.get_report(run_id, report_type, agent_id, max_chars, int(offset))
+    return service.get_report(run_id, report_type, agent_id, max_chars, int(offset), round)
 
 
 @mcp.tool()

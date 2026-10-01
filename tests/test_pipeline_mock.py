@@ -168,5 +168,9 @@ def test_missing_structured_block_is_reported(runs_dir, sample_paper):
     store, _ = _create(sample_paper, omit_json=["J2"])
     _run(store)
     meta, _ = read_report(store.dir / "judges/J2.md")
-    assert meta["structured_block"] != "ok"
-    assert "J2" in service.get_report(store.run_id, "matrix").split("could not be parsed")[-1]
+    assert meta["structured_block"] != "ok"  # as written
+    j2 = store.load_state()["agents"]["J2"]
+    assert j2["status"] == "complete" and j2["structured"] == "derived:headings"  # recovered from its headings
+    assert "structured data: derived:headings" in service.get_report(store.run_id, "gates", "J2")
+    matrix = service.get_report(store.run_id, "matrix")
+    assert "J2" in matrix.splitlines()[4]  # J2's verdicts are tabulated

@@ -32,9 +32,13 @@ ROLE_DIR = {
     "novelty": "novelty",
     "rigor": "rigor",
     "fit": "fit",
+    "verifier": "verify",
     "judge": "judges",
     "synthesis": "synthesis",
     "critic": "critic",
+    "adjudicator": "followup",
+    "revision": "synthesis",
+    "recheck": "critic",
 }
 
 class RunNotFound(LookupError):
@@ -74,7 +78,8 @@ class RunStore:
         run_dir = root / run_id
         run_dir.mkdir(parents=True, exist_ok=False)
         store = cls(run_dir)
-        for sub in ("source", "novelty", "rigor", "fit", "judges", "synthesis", "critic", "logs/agents", "archive"):
+        for sub in ("source", "novelty", "rigor", "fit", "verify", "prior", "judges", "synthesis", "critic",
+                    "followup", "logs/agents", "archive"):
             (run_dir / sub).mkdir(parents=True, exist_ok=True)
         atomic_write_json(store.metadata_path, metadata)
         atomic_write_text(store.config_path, yaml.safe_dump(raw_config, sort_keys=False, allow_unicode=True))
@@ -118,15 +123,20 @@ class RunStore:
     def source_dir(self) -> Path:
         return self.dir / "source"
 
+    @property
+    def prior_dir(self) -> Path:
+        """Text snapshots of the prior-work full texts read during this run (search/fulltext.py)."""
+        return self.dir / "prior"
+
     def role_dir(self, role: str) -> Path:
         return self.dir / ROLE_DIR[role]
 
     def report_path(self, agent_id: str, role: str) -> Path:
         if role == "intake":
             return self.source_dir / "profile.md"
-        if role == "synthesis":
+        if role in ("synthesis", "revision"):
             return self.role_dir(role) / ("memo.md" if agent_id == "S1" else f"memo_{agent_id}.md")
-        if role == "critic":
+        if role in ("critic", "recheck"):
             return self.role_dir(role) / ("completeness.md" if agent_id == "C1" else f"completeness_{agent_id}.md")
         return self.role_dir(role) / f"{agent_id}.md"
 
@@ -134,6 +144,9 @@ class RunStore:
         """suffix e.g. '.json', '.refcheck.json', '.search_log.jsonl'."""
         report = self.report_path(agent_id, role)
         return report.with_name(report.stem + suffix)
+
+    def gate_path(self, agent_id: str, role: str) -> Path:
+        return self.sidecar_path(agent_id, role, ".gate.json")
 
     def agent_log_dir(self, agent_id: str) -> Path:
         path = self.dir / "logs" / "agents" / agent_id
@@ -178,7 +191,7 @@ class RunStore:
             self.save_state(state)
             return result
 
-    def init_state(self, agents: list[dict]) -> None:
+    def init_state(self, agents: list[dict], verification: bool = False) -> None:
         state = {
             "run_id": self.run_id,
             "created_at": utcnow_iso(),
@@ -187,6 +200,8 @@ class RunStore:
             "calibration": {"tokens_per_char": None, "samples": []},
             "preflight": {},
         }
+        if verification:  # verifier agents are planned later, from the refuters' objections
+            state["verification"] = {"next_index": 1, "batches": {}}
         for spec in agents:
             state["agents"][spec["agent_id"]] = {
                 **spec,
@@ -217,7 +232,7 @@ class RunStore:
                     and not any(p.name.endswith(sfx) for sfx in keep_suffixes)]
         if not siblings:
             return None
-        stamp = utcnow().strftime("%Y%m%dT%H%M%SZ")
+        stamp = utcnow().strftime("%Y%m%dT%H%M%S%fZ")  # microseconds: two archives in one second must not merge
         dest = self.dir / "archive" / stamp / ROLE_DIR[role]
         dest.mkdir(parents=True, exist_ok=True)
         for path in siblings:

@@ -29,6 +29,12 @@ def normalize_model_id(model_id: str) -> str:
     return re.sub(r"\[[^\]]*\]$", "", model_id.strip())
 
 
+def substituted_models(requested: str, served: list[str]) -> list[str]:
+    """Models that served turns although another model was requested (date suffixes like -20251001 are fine)."""
+    want = normalize_model_id(requested)
+    return [m for m in served if not normalize_model_id(m).startswith(want)]
+
+
 class ModelRegistry:
     def __init__(self, data: dict):
         self.pricing_source: str = data.get("pricing_source", "")

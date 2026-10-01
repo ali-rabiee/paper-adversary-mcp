@@ -57,3 +57,12 @@ def test_full_model_ids_are_accepted_with_a_warning():
     cfg, _ = load_config({"fit": {"model": "claude-sonnet-9"}})
     issues = check_config(cfg, ModelRegistry.load())
     assert any(i.level == "warning" and "claude-sonnet-9" in i.message for i in issues)
+
+
+def test_every_prompt_file_loads():
+    from paper_adversary.prompts import load_prompt
+    from paper_adversary.util import prompts_dir
+
+    for path in sorted(prompts_dir().glob("*.md")):
+        prompt = load_prompt(path.stem)
+        assert prompt.meta.get("role") and prompt.meta.get("version"), path.name

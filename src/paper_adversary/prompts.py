@@ -12,7 +12,10 @@ import yaml
 from paper_adversary.util import prompts_dir, sha256_text
 
 _VAR = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*\}\}")
+_NAME = re.compile(r"[a-z0-9][a-z0-9_]*")  # a file stem under prompts/; never a path
 DEFAULT_LENS_SET = "lenses_v1"
+RUBRIC_SUFFIXES = (".md", ".markdown", ".txt")
+RUBRIC_MAX_BYTES = 100_000
 
 
 class PromptError(ValueError):
@@ -47,12 +50,20 @@ def _split_front_matter(text: str) -> tuple[dict, str]:
     return {}, text
 
 
+def check_name(name: str, what: str = "prompt") -> str:
+    """Prompt, lens-set and rubric names are file stems. Per-run overrides arrive through MCP tool arguments,
+    so a name must never be able to point outside prompts/."""
+    if not isinstance(name, str) or not _NAME.fullmatch(name):
+        raise PromptError(f"invalid {what} name {name!r}: use lowercase letters, digits and underscores")
+    return name
+
+
 def prompt_path(name: str) -> Path:
-    return prompts_dir() / f"{name}.md"
+    return prompts_dir() / f"{check_name(name)}.md"
 
 
 def prompt_exists(name: str) -> bool:
-    return prompt_path(name).is_file()
+    return isinstance(name, str) and bool(_NAME.fullmatch(name)) and prompt_path(name).is_file()
 
 
 def load_prompt(name: str) -> PromptTemplate:
@@ -69,7 +80,7 @@ def load_prompt(name: str) -> PromptTemplate:
 
 @lru_cache(maxsize=8)
 def _load_lens_set(lens_set: str) -> dict:
-    path = prompts_dir() / f"{lens_set}.yaml"
+    path = prompts_dir() / f"{check_name(lens_set, 'lens set')}.yaml"
     if not path.is_file():
         raise PromptError(f"lens set '{lens_set}' not found at {path}")
     return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -94,23 +105,69 @@ def assign_lens(role: str, index: int, n_agents: int, lens_set: str = DEFAULT_LE
 
 
 def rubric_path(name: str) -> Path:
-    return prompts_dir() / "rubrics" / f"{name}.md"
+    return prompts_dir() / "rubrics" / f"{check_name(name, 'rubric')}.md"
+
+
+def _looks_like_path(spec: str) -> bool:
+    if "\n" in spec or len(spec) >= 1024:
+        return False
+    if spec.startswith(("/", "~", "./", "../", ".\\", "..\\")) or re.match(r"[A-Za-z]:[\\/]", spec):
+        return True
+    if spec.lower().endswith(RUBRIC_SUFFIXES + (".env",)):
+        return True
+    try:
+        return Path(spec).expanduser().exists()
+    except (OSError, ValueError):
+        return False
+
+
+def _rubric_file(spec: str) -> Path:
+    """A rubric file given by path: a visible .md/.txt file of modest size, never a dotfile such as .env."""
+    path = Path(spec).expanduser()
+    try:
+        path = path.resolve(strict=True)
+    except OSError as exc:
+        raise PromptError(f"rubric file not found: {spec}") from exc
+    if not path.is_file():
+        raise PromptError(f"rubric path is not a file: {spec}")
+    if any(part.startswith(".") for part in path.parts[1:]):
+        raise PromptError(f"rubric file {spec} is hidden or inside a hidden folder; copy it to a visible .md file")
+    if path.suffix.lower() not in RUBRIC_SUFFIXES:
+        raise PromptError(f"rubric file must be one of {', '.join(RUBRIC_SUFFIXES)}: {spec}")
+    if path.stat().st_size > RUBRIC_MAX_BYTES:
+        raise PromptError(f"rubric file is larger than {RUBRIC_MAX_BYTES // 1000} KB: {spec}")
+    return path
 
 
 def rubric_exists(spec: str | None) -> bool:
     if not spec:
         return False
-    return rubric_path(spec).is_file() or Path(spec).expanduser().is_file() or "\n" in spec
+    try:
+        load_rubric(spec)
+    except PromptError:
+        return False
+    return True
 
 
 def load_rubric(spec: str | None) -> tuple[str, str]:
-    """Return (label, text) for a rubric given by name, file path, or literal text."""
+    """Return (label, text) for a rubric given by name (prompts/rubrics/), file path, or literal text."""
+    from paper_adversary.isolation import find_secrets
+
     if not spec:
         return ("none", "")
-    if rubric_path(spec).is_file():
-        meta, body = _split_front_matter(rubric_path(spec).read_text(encoding="utf-8"))
+    spec = spec.strip()
+    if _NAME.fullmatch(spec):
+        path = rubric_path(spec)
+        if not path.is_file():
+            raise PromptError(f"rubric '{spec}' not found in prompts/rubrics/")
+        _, body = _split_front_matter(path.read_text(encoding="utf-8"))
         return (spec, body.strip())
-    candidate = Path(spec).expanduser()
-    if len(spec) < 1024 and "\n" not in spec and candidate.is_file():
-        return (str(candidate), candidate.read_text(encoding="utf-8").strip())
-    return ("inline", spec.strip())
+    if _looks_like_path(spec):
+        path = _rubric_file(spec)
+        label, text = str(path), path.read_text(encoding="utf-8", errors="replace").strip()
+    else:
+        label, text = "inline", spec
+    secrets = find_secrets(text)
+    if secrets:
+        raise PromptError(f"rubric {label} looks like it contains a secret ({', '.join(secrets)}); refusing to use it")
+    return (label, text)

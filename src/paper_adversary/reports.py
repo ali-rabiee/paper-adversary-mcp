@@ -15,7 +15,6 @@ SEVERITY_LABEL = {"FATAL": "FATAL", "MAJOR_FIXABLE": "MAJOR BUT FIXABLE", "MINOR
                   "NOT_CONVINCING": "NOT CONVINCING"}
 SEVERITY_RANK = {"FATAL": 3, "MAJOR_FIXABLE": 2, "MINOR": 1, "NOT_CONVINCING": 0}
 
-_FENCE = re.compile(r"```(?:json|JSON)?[ \t]*\n(.*?)\n```", re.S)
 
 
 # ---------------------------------------------------------------- files
@@ -41,26 +40,6 @@ def strip_marker(body: str) -> str:
 
 
 # ---------------------------------------------------------------- structured blocks
-
-
-def extract_json_block(text: str) -> tuple[dict | None, str | None]:
-    """Return the last fenced JSON object in the text, or (None, reason)."""
-    blocks = _FENCE.findall(text)
-    if not blocks:
-        return None, "no fenced JSON block found"
-    last_error = "unparseable JSON"
-    for raw in reversed(blocks):
-        raw = raw.strip()
-        if not raw.startswith("{"):
-            continue
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            last_error = f"invalid JSON: {exc}"
-            continue
-        if isinstance(data, dict):
-            return data, None
-    return None, last_error
 
 
 def normalize_severity(value: object) -> str | None:
@@ -103,6 +82,43 @@ def judge_judgments(data: dict | None) -> list[dict]:
     return out
 
 
+# Novelty objections that claim the prior work already contains something. These must be shown with verbatim
+# full-text evidence before a FATAL or MAJOR verdict on them counts as established (evidence_gate.py).
+PRIOR_WORK_CATEGORIES = {"already_done", "partially_anticipated", "framing_exists", "gap_not_real", "concurrent_work"}
+EVIDENCE_STATUSES = ("verified_independent", "verified_quotes_only", "disputed", "abstract_only",
+                     "fulltext_unavailable", "unverified", "not_applicable")
+
+
+_CATEGORY_ALIASES = {"anticipated": "partially_anticipated", "prior_work": "already_done",
+                     "already_exists": "already_done", "not_novel": "already_done", "exists": "already_done",
+                     "concurrent": "concurrent_work", "framing": "framing_exists", "no_gap": "gap_not_real"}
+
+
+def normalize_category(value: object) -> str:
+    key = re.sub(r"[^a-z]+", "_", str(value or "").lower()).strip("_") if isinstance(value, str) else ""
+    return _CATEGORY_ALIASES.get(key, key)
+
+
+def is_prior_work_objection(obj: dict) -> bool:
+    """Whether an objection rests on prior work. Exact labels are not trusted: any objection that cites
+    references is treated as one (except a pure missing-citation note), so a relabelled overlap claim
+    cannot slip past the evidence gate."""
+    category = normalize_category(obj.get("category"))
+    refs = obj.get("references")
+    return category in PRIOR_WORK_CATEGORIES or (bool(refs) and isinstance(refs, list)
+                                                 and category != "missing_citation")
+
+
+def is_decisive(obj: dict) -> bool:
+    severity = normalize_category(obj.get("severity_estimate"))
+    return is_prior_work_objection(obj) and severity in {"fatal", "major", "major_but_fixable"}
+
+
+def normalize_evidence_status(value: object) -> str | None:
+    key = re.sub(r"[^a-z]+", "_", str(value or "").lower()).strip("_")
+    return key if key in EVIDENCE_STATUSES else None
+
+
 def references_from(data: dict | None) -> list[dict]:
     refs: list[dict] = []
     if not data:
@@ -120,12 +136,16 @@ def references_from(data: dict | None) -> list[dict]:
 # ---------------------------------------------------------------- judgment matrix
 
 
-def build_judgment_matrix(objections: dict[str, list[dict]], judgments: dict[str, list[dict]]) -> dict:
+def build_judgment_matrix(objections: dict[str, list[dict]], judgments: dict[str, list[dict]],
+                          excluded: dict[str, str] | None = None) -> dict:
     """Cross-tabulate every refuter objection against every judge's verdict.
 
     Verdicts are kept per judge, never averaged. Flags mark objections no judge
     classified, objections some judges skipped, and contested objections.
+    `excluded` names refuters and judges left out (failed or quarantined) with a
+    short label; judge citations of an excluded refuter's IDs are listed apart.
     """
+    excluded = excluded or {}
     known = {o["id"]: o for objs in objections.values() for o in objs}
     rows: dict[str, dict] = {
         oid: {"id": oid, "source": o["source"], "title": o.get("title") or o.get("objection") or "",
@@ -133,11 +153,17 @@ def build_judgment_matrix(objections: dict[str, list[dict]], judgments: dict[str
         for oid, o in known.items()
     }
     unknown_refs: dict[str, list[str]] = {}
+    excluded_refs: dict[str, list[str]] = {}
+    double: dict[str, list[str]] = {}
     for jid, items in judgments.items():
         for item in items:
             for oid in item["objection_ids"]:
                 if oid not in rows:
-                    unknown_refs.setdefault(jid, []).append(oid)
+                    target = excluded_refs if oid.split("-")[0] in excluded else unknown_refs
+                    target.setdefault(jid, []).append(oid)
+                    continue
+                if jid in rows[oid]["verdicts"]:  # keep the first verdict and say so; never overwrite silently
+                    double.setdefault(jid, []).append(oid)
                     continue
                 rows[oid]["verdicts"][jid] = {"severity": item.get("severity"),
                                               "confidence": item.get("confidence"),
@@ -157,23 +183,26 @@ def build_judgment_matrix(objections: dict[str, list[dict]], judgments: dict[str
         "partially_classified": [r["id"] for r in ordered if 0 < len(r["unclassified_by"]) < len(judges)],
         "contested": [r["id"] for r in ordered if r["contested"]],
         "unknown_ids_cited_by_judges": unknown_refs,
+        "ids_of_excluded_refuters_cited_by_judges": excluded_refs,
+        "classified_twice": double,
+        "excluded": excluded,
         "judges_without_structured_output": [],
+        "refuters_without_structured_data": [],
     }
 
 
-def matrix_markdown(matrix: dict) -> str:
+def matrix_markdown(matrix: dict, title: str = "Judgment matrix", followup: bool = False) -> str:
+    """The base judgment matrix, or (followup=True) a round's critic items against the adjudicators' rulings."""
     judges = matrix["judges"]
-    head = "| Objection | Source | Title | " + " | ".join(judges) + " | Flags |"
-    sep = "|" + "---|" * (4 + len(judges))
-    lines = [
-        "# Judgment matrix",
-        "",
+    evidence = any(r.get("evidence") for r in matrix["rows"])
+    row = "Item" if followup else "Objection"
+    head = f"| {row} | Source | Title | " + " | ".join(judges) + (" | Evidence" if evidence else "") + " | Flags |"
+    sep = "|" + "---|" * (4 + len(judges) + (1 if evidence else 0))
+    note = ("Computed by the orchestrator from the critic's items and the adjudicators' structured blocks. "
+            "Each cell is one adjudicator's own ruling; nothing is averaged.") if followup else (
         "Computed by the orchestrator from the refuters' and judges' structured blocks. "
-        "Each cell is one judge's own verdict; nothing is averaged.",
-        "",
-        head,
-        sep,
-    ]
+        "Each cell is one judge's own verdict; nothing is averaged.")
+    lines = [f"# {title}", "", note, "", head, sep]
     for r in matrix["rows"]:
         cells = []
         for j in judges:
@@ -186,13 +215,31 @@ def matrix_markdown(matrix: dict) -> str:
         if r["unclassified_by"] and judges:
             flags.append("not classified by " + ",".join(r["unclassified_by"]))
         title = (r["title"] or "").replace("|", "/")[:90]
-        lines.append(f"| {r['id']} | {r['source']} | {title} | " + " | ".join(cells) + f" | {'; '.join(flags)} |")
-    lines += ["", f"Objections no judge classified: {', '.join(matrix['never_classified']) or 'none'}",
+        ev = f" | {(r.get('evidence') or '—').replace('|', '/')}" if evidence else ""
+        lines.append(f"| {r['id']} | {r['source']} | {title} | " + " | ".join(cells) + ev + f" | {'; '.join(flags)} |")
+    never = "Items no adjudicator ruled on" if followup else "Objections no judge classified"
+    lines += ["", f"{never}: {', '.join(matrix['never_classified']) or 'none'}",
               f"Contested (verdicts two or more levels apart): {', '.join(matrix['contested']) or 'none'}"]
     if matrix["unknown_ids_cited_by_judges"]:
         lines.append("Judge citations of objection IDs that do not exist: "
                      + "; ".join(f"{j}: {', '.join(v)}" for j, v in matrix["unknown_ids_cited_by_judges"].items()))
+    gate = matrix.get("evidence_gate")
+    if gate is not None:
+        lines.append("Evidence gate (judges/evidence_gate.md): serious verdicts on prior work that are not shown: "
+                     + (", ".join(gate.get("flagged_ids") or []) or "none"))
+    if matrix.get("classified_twice"):
+        lines.append("Objections a judge classified more than once (the first verdict is shown): "
+                     + "; ".join(f"{j}: {', '.join(v)}" for j, v in matrix["classified_twice"].items()))
     if matrix.get("judges_without_structured_output"):
-        lines.append("Judges whose structured block could not be parsed (read their reports directly): "
+        lines.append("Judges without structured data, not tabulated (read their reports directly): "
                      + ", ".join(matrix["judges_without_structured_output"]))
+    if matrix.get("refuters_without_structured_data"):
+        lines.append("Refuters released without structured data, so their objections are not tabulated: "
+                     + ", ".join(matrix["refuters_without_structured_data"]))
+    if matrix.get("excluded"):
+        lines.append("Not included (no usable output): " + "; ".join(matrix["excluded"].values()))
+    if matrix.get("ids_of_excluded_refuters_cited_by_judges"):
+        lines.append("Judge citations of objections from excluded refuters: "
+                     + "; ".join(f"{j}: {', '.join(v)}" for j, v in
+                                 matrix["ids_of_excluded_refuters_cited_by_judges"].items()))
     return "\n".join(lines) + "\n"

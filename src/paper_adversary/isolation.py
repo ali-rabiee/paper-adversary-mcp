@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import secrets
 from dataclasses import dataclass
@@ -29,22 +30,42 @@ from pathlib import Path
 
 from paper_adversary.util import atomic_write_json, read_json, read_jsonl, sha256_text, utcnow
 
-# kind -> which roles may read it. "paper" and "rubric" are inputs, not agent outputs.
+# kind -> which roles may read it. "paper", "rubric" and "prior_text" (third-party full texts) are inputs, not
+# agent outputs; "evidence" (quote checks) and "vtask" (a verifier's passages) are computed by the orchestrator.
 ROLE_VISIBILITY: dict[str, frozenset[str]] = {
     "intake": frozenset({"paper"}),
     "novelty": frozenset({"paper"}),
     "rigor": frozenset({"paper"}),
     "fit": frozenset({"paper"}),
-    "judge": frozenset({"paper", "rubric", "novelty", "rigor", "fit", "refcheck"}),
-    "synthesis": frozenset({"paper", "rubric", "novelty", "rigor", "fit", "refcheck", "judge", "matrix",
-                            "profile"}),
-    "critic": frozenset({"paper", "rubric", "novelty", "rigor", "fit", "refcheck", "judge", "matrix", "profile",
-                         "synthesis"}),
+    "verifier": frozenset({"paper", "prior_text", "vtask"}),
+    "judge": frozenset({"paper", "rubric", "novelty", "rigor", "fit", "refcheck", "evidence", "verification",
+                        "prior_text"}),
+    "synthesis": frozenset({"paper", "rubric", "novelty", "rigor", "fit", "refcheck", "evidence", "verification",
+                            "prior_text", "judge", "matrix", "profile"}),
+    "critic": frozenset({"paper", "rubric", "novelty", "rigor", "fit", "refcheck", "evidence", "verification",
+                         "prior_text", "judge", "matrix", "profile", "synthesis"}),
 }
 
+# Follow-up rounds: adjudicators, the revised memo and the re-check critic see the whole review plus the round's
+# own artifacts ("followup" = the orchestrator's triage and follow-up matrix). Who sees whom inside a round is
+# decided by position (below): only strictly earlier steps.
+_FOLLOWUP_KINDS = frozenset({"critic", "recheck", "adjudication", "revision", "followup"})
+for _role in ("adjudicator", "revision", "recheck"):
+    ROLE_VISIBILITY[_role] = ROLE_VISIBILITY["critic"] | _FOLLOWUP_KINDS
+
 # Agent outputs and the artifact kind they produce.
-OUTPUT_KIND = {"intake": "profile", "novelty": "novelty", "rigor": "rigor", "fit": "fit", "judge": "judge",
-               "synthesis": "synthesis", "critic": "critic"}
+OUTPUT_KIND = {"intake": "profile", "novelty": "novelty", "rigor": "rigor", "fit": "fit", "verifier": "verification",
+               "judge": "judge", "synthesis": "synthesis", "critic": "critic", "adjudicator": "adjudication",
+               "revision": "revision", "recheck": "recheck"}
+KIND_ROLE = {"profile": "intake", "verification": "verifier", "adjudication": "adjudicator"}
+
+# Order of steps: an artifact is readable only if it comes strictly before the reader. Base review is round 0.
+BASE_POS = {"intake": 0, "novelty": 0, "rigor": 0, "fit": 0, "verifier": 1, "judge": 2, "synthesis": 3, "critic": 4}
+FOLLOWUP_POS = {"verifier": 0, "adjudicator": 1, "revision": 2, "recheck": 3}
+
+
+def position(role: str, rnd: int = 0) -> tuple[int, int]:
+    return (rnd, (BASE_POS if rnd == 0 else FOLLOWUP_POS).get(role, 0))
 
 MARKER_RE = re.compile(r"<!-- aid:([A-Z0-9]+):([0-9a-f]{12}) -->")
 _WORD = re.compile(r"[a-z0-9]+")
@@ -55,6 +76,45 @@ HIT_THRESHOLD = 3
 
 class IsolationViolation(RuntimeError):
     pass
+
+
+# Credentials must never reach an agent's prompt (and from there a model, a report or a log). Papers about LLM
+# tooling print placeholders ("sk-ant-api03-XXXX...", AKIAIOSFODNN7EXAMPLE, "-----BEGIN PRIVATE KEY-----" alone),
+# so a match counts only if the value looks random; the values this process actually holds always count.
+def _random_looking(value: str, need_digit: bool = True) -> bool:
+    value = value.strip("\"'`")
+    if len(value) < 16 or len(set(value)) < 10 or "example" in value.lower():
+        return False
+    if re.search(r"(.)\1{5}", value):  # XXXXXX, 000000: a placeholder
+        return False
+    return any(c.isalpha() for c in value) and (any(c.isdigit() for c in value) or not need_digit)
+
+
+_SECRET_PATTERNS = (
+    ("an Anthropic API key or OAuth token", re.compile(r"sk-ant-[A-Za-z0-9_\-]{16,}"),
+     lambda m: _random_looking(re.sub(r"^sk-ant-(?:[a-z]{3,6}\d{2}-)?", "", m.group(0)))),
+    ("a credential assignment", re.compile(r"\b(?:CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|"
+                                           r"S2_API_KEY|OPENALEX_API_KEY)[ \t]*[=:][ \t]*(\S{8,})"),
+     lambda m: _random_looking(m.group(1))),
+    ("a private key", re.compile(r"-----BEGIN [A-Z ]{0,40}PRIVATE KEY-----\s*(?:[A-Za-z-]{1,40}:[^\n]{0,300}\n\s*)*"
+                                 r"[A-Za-z0-9+/]{40,}"), None),
+    ("an AWS access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b"), lambda m: _random_looking(m.group(0), need_digit=False)),
+    ("a GitHub token", re.compile(r"\b(?:ghp|gho|ghu|ghs)_[A-Za-z0-9]{30,}|\bgithub_pat_[A-Za-z0-9_]{40,}"),
+     lambda m: _random_looking(re.sub(r"^(?:gh[pous]_|github_pat_)", "", m.group(0)))),
+)
+SECRET_ENV_VARS = ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "S2_API_KEY",
+                   "OPENALEX_API_KEY")
+
+
+def find_secrets(text: str) -> list[str]:
+    """Labels of anything in `text` that looks like a credential, including the values this process holds."""
+    found = [label for label, rx, real in _SECRET_PATTERNS
+             if any(real is None or real(m) for m in rx.finditer(text))]
+    for var in SECRET_ENV_VARS:
+        value = (os.environ.get(var) or "").strip()
+        if len(value) >= 12 and value in text:
+            found.append(f"the value of {var}")
+    return found
 
 
 def new_marker(agent_id: str) -> str:
@@ -94,13 +154,14 @@ class ReportRecord:
 class ArtifactAccess:
     """Policy-checked reader handed to context builders. Records a manifest of what was read."""
 
-    def __init__(self, store, role: str, agent_id: str):
+    def __init__(self, store, role: str, agent_id: str, pos: tuple[int, int] | None = None):
         if role not in ROLE_VISIBILITY:
             raise IsolationViolation(f"unknown role '{role}'")
         self.store = store
         self.role = role
         self.agent_id = agent_id
         self.visible = ROLE_VISIBILITY[role]
+        self.pos = pos  # the reader's (round, step); reports from the same or a later step stay hidden
         self.manifest: list[dict] = []
         self.texts: list[str] = []  # everything handed out through this reader (used by the guard's allowance)
 
@@ -124,12 +185,14 @@ class ArtifactAccess:
         from paper_adversary.reports import read_report
 
         self._require(kind)
-        role = {"profile": "intake"}.get(kind, kind)
+        role = KIND_ROLE.get(kind, kind)
         out = []
         for aid, a in sorted(state.get("agents", {}).items(), key=lambda kv: _agent_sort_key(kv[0])):
             if a.get("role") != role or a.get("status") != "complete":
                 continue
             if aid == self.agent_id:
+                continue
+            if self.pos is not None and position(role, int(a.get("round") or 0)) >= tuple(self.pos):
                 continue
             path = self.store.report_path(aid, role)
             if not path.is_file():
@@ -174,17 +237,31 @@ class IsolationGuard:
     def _load(self) -> dict:
         return read_json(self.path, {}) or {}
 
-    def register(self, agent_id: str, role: str, marker: str, body: str, exclude: set[str]) -> None:
+    def register(self, agent_id: str, role: str, marker: str, body: str, exclude: set[str],
+                 pos: tuple[int, int] | None = None) -> None:
         data = self._load()
-        data[agent_id] = {"kind": OUTPUT_KIND[role], "marker": marker,
+        data[agent_id] = {"kind": OUTPUT_KIND[role], "marker": marker, "position": list(pos or position(role)),
                           "shingles": distinctive_shingles(body, exclude)}
         atomic_write_json(self.path, data)
 
-    def forbidden(self, role: str, agent_id: str) -> dict[str, dict]:
+    def forbidden(self, role: str, agent_id: str, pos: tuple[int, int] | None = None) -> dict[str, dict]:
         """Fingerprints of every artifact whose kind this role may not see (an agent's own earlier reports
-        are always of such a kind: refuters see no reports, judges no judge reports, and so on)."""
+        are always of such a kind: refuters see no reports, judges no judge reports, and so on), every
+        quarantined report, which no role may see, and, given the reader's position, everything from the same or
+        a later step (so two adjudicators never see each other, and a rerun never sees what came after it)."""
         visible = ROLE_VISIBILITY[role]
-        return {aid: fp for aid, fp in self._load().items() if fp["kind"] not in visible}
+        out = {}
+        for aid, fp in self._load().items():
+            fp_pos = tuple(fp.get("position") or position(KIND_ROLE.get(fp["kind"], fp["kind"])))
+            if fp["kind"] not in visible or fp.get("quarantined") or (pos is not None and fp_pos >= tuple(pos)):
+                out[aid] = fp
+        return out
+
+    def set_quarantined(self, agent_id: str, flag: bool) -> None:
+        data = self._load()
+        if agent_id in data:
+            data[agent_id]["quarantined"] = flag
+            atomic_write_json(self.path, data)
 
     def archive(self, agent_id: str) -> None:
         """Keep a superseded report's fingerprint (still forbidden by kind) under an archived key."""
@@ -214,25 +291,62 @@ class IsolationGuard:
                 found.append({"artifact": aid, "kind": fp["kind"], "marker": marker_hit, "shingle_hits": shingle_hits})
         return found
 
-    def check_prompt(self, role: str, agent_id: str, prompt_text: str, allowed_text: str = "") -> None:
-        hits = self._hits(prompt_text, self.forbidden(role, agent_id), set(_shingles(allowed_text)))
+    @staticmethod
+    def check_secrets(agent_id: str, prompt_text: str) -> None:
+        found = find_secrets(prompt_text)
+        if found:
+            raise IsolationViolation(f"refusing to start {agent_id}: its prompt contains {', '.join(found)}")
+
+    def check_prompt(self, role: str, agent_id: str, prompt_text: str, allowed_text: str = "",
+                     pos: tuple[int, int] | None = None) -> None:
+        hits = self._hits(prompt_text, self.forbidden(role, agent_id, pos), set(_shingles(allowed_text)))
         if hits:
             names = ", ".join(f"{h['artifact']} ({h['kind']})" for h in hits)
             raise IsolationViolation(f"refusing to start {agent_id}: its prompt contains content from {names}")
 
-    def audit(self, role: str, agent_id: str, transcript: Path, sandbox: Path | None, report_text: str) -> dict:
-        """Post-run check of what the agent actually touched."""
+    def audit(self, role: str, agent_id: str, transcript: Path | None, sandbox: Path | None, report_text: str,
+              required_events: tuple[str, ...] = ("init", "result"), pos: tuple[int, int] | None = None) -> dict:
+        """Post-run check of what the agent actually touched.
+
+        "fail": evidence of contamination (a file outside the sandbox was read, forbidden content arrived in a
+        tool result, or the report carries another report's marker). "unverifiable": the transcript cannot show
+        that isolation held (missing, empty, or without the init/result events). Attempts the sandbox refused
+        are recorded as "denied" without failing the audit.
+        """
         findings: list[str] = []
-        forbidden = self.forbidden(role, agent_id)
+        unverifiable: list[str] = []
+        denied: list[str] = []
+        forbidden = self.forbidden(role, agent_id, pos)
+        events = read_jsonl(transcript) if transcript is not None else []
+        if transcript is None or not transcript.is_file():
+            unverifiable.append("no transcript was recorded")
+        elif not events:
+            unverifiable.append("the transcript is empty")
+        else:
+            kinds = {ev.get("kind") for ev in events}
+            unverifiable += [f"the transcript has no {k} event" for k in required_events if k not in kinds]
+        results = {ev.get("tool_use_id"): ev for ev in events if ev.get("kind") == "tool_result"}
+        refused = {d.get("tool_use_id") for ev in events if ev.get("kind") == "result"
+                   for d in ev.get("permission_denials") or [] if isinstance(d, dict)}
         tool_results: list[str] = []
-        for ev in read_jsonl(transcript):
+        for ev in events:
             if ev.get("kind") == "tool_use":
                 name = ev.get("name", "")
                 inp = ev.get("input") or {}
                 for key in ("file_path", "path", "notebook_path"):
                     value = inp.get(key) if isinstance(inp, dict) else None
-                    if value and sandbox is not None and not _inside(Path(value), sandbox):
-                        findings.append(f"{name} touched a path outside its sandbox: {value}")
+                    if not value:
+                        continue
+                    if sandbox is None:
+                        unverifiable.append(f"{name} used a file path ({value}) but the sandbox is unknown")
+                    elif not _inside(Path(str(value)).expanduser(), sandbox):
+                        res = results.get(ev.get("id"))
+                        if ev.get("id") in refused or (res is not None and res.get("is_error")):
+                            denied.append(f"{name} tried {value} outside its sandbox and was refused")
+                        elif res is None:
+                            unverifiable.append(f"{name} touched {value} outside its sandbox; no result was recorded")
+                        else:
+                            findings.append(f"{name} read a path outside its sandbox: {value}")
             elif ev.get("kind") == "tool_result":
                 tool_results.append(str(ev.get("content", "")))
         # Search results can legitimately repeat a sentence another refuter quoted from the same abstract,
@@ -243,8 +357,9 @@ class IsolationGuard:
         for m in MARKER_RE.finditer(report_text):
             if m.group(0) in forbidden_markers:
                 findings.append(f"the report contains the marker of {forbidden_markers[m.group(0)]}")
-        return {"status": "fail" if findings else "pass", "findings": findings,
-                "checked_against": sorted(forbidden)}
+        status = "fail" if findings else ("unverifiable" if unverifiable else "pass")
+        return {"status": status, "findings": findings, "unverifiable": unverifiable, "denied": denied,
+                "events": len(events), "checked_against": sorted(forbidden)}
 
 
 def _inside(path: Path, root: Path) -> bool:

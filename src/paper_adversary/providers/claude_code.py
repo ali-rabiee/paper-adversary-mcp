@@ -28,8 +28,8 @@ from pathlib import Path
 
 from paper_adversary.config import ProviderConfig
 from paper_adversary.providers.base import AgentRequest, AgentResult, ErrorKind, ProviderError
-from paper_adversary.registry import normalize_model_id
-from paper_adversary.util import append_jsonl, atomic_write_json, atomic_write_text, utcnow
+from paper_adversary.registry import normalize_model_id, substituted_models
+from paper_adversary.util import append_jsonl, atomic_write_json, atomic_write_text, read_jsonl, utcnow
 
 BUILTIN_TOOL = {"web_search": "WebSearch", "web_fetch": "WebFetch", "read_pdf": "Read"}
 MCP_SERVER = "lit"
@@ -307,12 +307,18 @@ class ClaudeCodeProvider:
             if normalize_model_id(key).startswith(normalize_model_id(model)) and isinstance(val, dict):
                 ctx = val.get("contextWindow") or ctx
         applied = PROBE_WORD in result.text.upper()
+        kinds = {ev.get("kind") for ev in read_jsonl(result.transcript_path)} if result.transcript_path else set()
         out.update(ok=applied, served_models=served, context_window=ctx, warnings=result.warnings,
-                   runtime=result.runtime, reply=result.text[:80], system_prompt_applied=applied)
+                   runtime=result.runtime, reply=result.text[:80], system_prompt_applied=applied,
+                   substituted=substituted_models(model, served))
         if not applied:  # agents would silently lose their role instructions and output format
             out.update(error_kind=ErrorKind.TOOL_SETUP.value,
                        error=f"the agent system prompt was not applied (reply: {result.text[:60]!r}); try "
                              "provider.safe_mode: false in config/default.yaml")
+        elif not {"init", "result"} <= kinds:  # without them every agent's isolation audit is unverifiable
+            out.update(ok=False, error_kind=ErrorKind.ISOLATION.value,
+                       error="Claude Code's output stream had no init or result event, so agents' isolation "
+                             "could not be audited; check `claude --version` and `claude update`")
         return out
 
 
@@ -515,8 +521,7 @@ class _StreamState:
             text = "\n".join(self.last_text).strip()
         if not text:
             raise ProviderError(ErrorKind.EMPTY_OUTPUT, "the agent produced no final text", usage=res.get("usage"))
-        requested = normalize_model_id(self.req.model)
-        substituted = [m for m in self.served if not normalize_model_id(m).startswith(requested)]
+        substituted = substituted_models(self.req.model, self.served)
         if substituted:
             self.warnings.append(f"MODEL SUBSTITUTION: requested {self.req.model} but turns were served by "
                                  f"{', '.join(substituted)}")

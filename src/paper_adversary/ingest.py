@@ -114,6 +114,8 @@ def ingest(paper_path: str | Path | None = None, paper_text: str | None = None,
         path = Path(paper_path).expanduser().resolve()
         if not path.is_file():
             raise IngestError(f"file not found: {path}")
+        if any(part.startswith(".") for part in path.parts[1:]):  # .env, ~/.ssh/..., ~/.netrc
+            raise IngestError(f"{path} is hidden or inside a hidden folder; copy the paper somewhere visible")
         suffix = path.suffix.lower()
         if suffix == ".pdf":
             result = ingest_pdf(path)
@@ -121,7 +123,7 @@ def ingest(paper_path: str | Path | None = None, paper_text: str | None = None,
             result = ingest_markdown(path.read_text(encoding="utf-8", errors="replace"), "markdown")
         elif suffix == ".tex":
             result = ingest_latex(path)
-        elif suffix in {".txt", ".text", ""}:
+        elif suffix in {".txt", ".text"}:
             result = ingest_plain_text(path.read_text(encoding="utf-8", errors="replace"), "text")
         else:
             raise IngestError(f"unsupported file type '{suffix}' (supported: .pdf .md .markdown .tex .txt)")
@@ -130,6 +132,11 @@ def ingest(paper_path: str | Path | None = None, paper_text: str | None = None,
         text = paper_text or ""
         looks_md = bool(re.search(r"^#{1,6}\s+\S", text, re.M))
         result = ingest_markdown(text, "inline") if looks_md else ingest_plain_text(text, "inline")
+    from paper_adversary.isolation import find_secrets
+
+    secrets = find_secrets(result.text_md)
+    if secrets:  # never copy credentials into a run, where reports and agents could read them
+        raise IngestError(f"the input looks like it contains credentials ({', '.join(secrets)}); refusing to ingest it")
     result.submission_type = _decide_type(result, submission_type)
     if len(result.text_md.strip()) < 200:
         result.warnings.append("very little text was extracted; check the source (scanned PDF?)")
@@ -570,7 +577,7 @@ def _strip_number(text: str) -> tuple[str | None, str]:
     return (m.group(1), m.group(2)) if m else (None, text.strip())
 
 
-def ingest_pdf(path: Path) -> IngestResult:
+def ingest_pdf(path: Path, max_pages: int | None = None) -> IngestResult:
     try:
         import pymupdf
     except ImportError as exc:  # pragma: no cover
@@ -579,10 +586,15 @@ def ingest_pdf(path: Path) -> IngestResult:
     warnings: list[str] = []
     doc = pymupdf.open(path)
     page_count = doc.page_count
+    pages_read = page_count if max_pages is None else min(page_count, max(1, max_pages))
+    if pages_read < page_count:
+        warnings.append(f"only the first {pages_read} of {page_count} pages were extracted")
     toc = doc.get_toc(simple=True) or []
     lines: list[_Line] = []
     heights: dict[int, float] = {}
     for pno, page in enumerate(doc, start=1):
+        if pno > pages_read:
+            break
         heights[pno] = page.rect.height or 792.0
         width = page.rect.width or 612.0
         data = page.get_text("dict")
@@ -611,7 +623,7 @@ def ingest_pdf(path: Path) -> IngestResult:
         raise IngestError("no extractable text in the PDF (scanned image?); OCR it first or provide the source")
 
     body_size = _body_font_size(lines)
-    lines = _drop_running_headers(lines, heights, page_count)
+    lines = _drop_running_headers(lines, heights, pages_read)
     lines = _merge_number_lines(lines, body_size)
     title = _pdf_title(doc_meta, lines, body_size)
 
