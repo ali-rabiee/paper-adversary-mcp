@@ -6,8 +6,8 @@ from paper_adversary.config import ConfigError, check_config, load_config, plan_
 from paper_adversary.registry import ModelRegistry
 
 
-def test_defaults_match_the_requested_split():
-    cfg, _ = load_config()
+def test_legacy_thorough_keeps_the_previous_split():
+    cfg, _ = load_config(preset="legacy_thorough")
     reg = ModelRegistry.load()
     assert check_config(cfg, reg) == [] or all(i.level == "warning" for i in check_config(cfg, reg))
     specs = plan_agents(cfg, reg)
@@ -21,10 +21,11 @@ def test_defaults_match_the_requested_split():
     assert [s.agent_id for s in by_role["novelty"]] == ["N1", "N2", "N3", "N4"]
     assert len({s.lens["id"] for s in by_role["novelty"]}) == 4  # distinct primary focus per agent
     assert all(s.lens is None for s in by_role["judge"])
+    assert cfg.verifier.routing == "fixed" and cfg.followup.max_rounds == 2
 
 
-def test_override_merges_deeply():
-    cfg, raw = load_config({"novelty": {"agents": 6}, "rigor": {"effort": "high"}})
+def test_trusted_settings_merge_deeply_and_may_raise_counts():
+    cfg, raw = load_config(None, {"novelty": {"agents": 6}, "rigor": {"effort": "high"}}, "legacy_thorough")
     assert cfg.novelty.agents == 6 and cfg.novelty.model == "opus-5.5" and cfg.rigor.effort == "high"
     specs = plan_agents(cfg, ModelRegistry.load())
     n = [s for s in specs if s.role == "novelty"]

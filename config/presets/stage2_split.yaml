@@ -1,0 +1,146 @@
+# stage2_split: the ICML 2027 project's Stage-2 candidate reviews (one run per candidate concept).
+#
+# Model split chosen by the user on 2026-09-29 from options: novelty and fit refuters on Opus 5.5 at high;
+# rigor refuters, judges and the synthesis memo on Fable 5.1 at max; the completeness critic on Fable 5.1 at
+# xhigh. The follow-up roles mirror their base roles (adjudicators like judges, the revised memo like the
+# synthesis, the re-check like the critic). Blind verifiers keep the MCP's cross-model routing, so the Opus
+# novelty refuters' decisive objections are verified on Fable 5.1 (high).
+#
+# Panel sizes follow the earlier blind pass of the same review (one rigor and one fit refuter, three judges),
+# with two novelty refuters split by lens. Max effort appears here, so this preset is trusted configuration:
+# select it with `preset: stage2_split` in a --trusted-config file, not per run.
+#
+# 2026-10-02, after the K1 pilot audit, the user chose a lighter Fable panel from options: two judges (both
+# Fable 5.1 max) instead of three; follow-up adjudicators Opus 5.5 high (A1) and Fable 5.1 max (A2) instead of
+# two Fable 5.1 max; the re-check critic on Fable 5.1 high instead of xhigh. Everything else is unchanged:
+# novelty 2 x Opus 5.5 high, rigor 1 x Fable 5.1 max, fit 1 x Opus 5.5 high, synthesis Fable 5.1 max, critic
+# Fable 5.1 xhigh, revised memo Fable 5.1 max, cross-model verifiers (Fable 5.1 high for Opus authors).
+# The same day the audit's fixes selected new prompt versions here (each commented where it is set):
+# novelty_v3, rigor_v2, fit_v2 (refuters read the rubric; ideas judged by planned tests and theorem targets;
+# tool sentence), verifier_v2, judge_v3, synthesis_v4 (ledger IDs L1, L2, ...), critic_v3, adjudicator_v2
+# and critic_recheck_v2. Runs created earlier keep their own saved configuration.
+# Also on 2026-10-02 (audit F27): plan_limit.model_window_reserve 0.15, the share of Fable 5.1's model-specific
+# weekly window the K1 pilot used (0 -> 0.15), so a run stops before its first Fable agent when that window
+# cannot hold another run.
+
+description: ICML 2027 Stage-2 candidate reviews. Opus 5.5 high for novelty and fit; Fable 5.1 max for rigor, two judges and memos; Fable 5.1 xhigh critic; adjudicators Opus 5.5 high and Fable 5.1 max; Fable 5.1 high re-check.
+lens_set: lenses_v2
+
+orchestrator:
+  enabled: true
+  model: opus-5.5
+  effort: high
+  prompt: intake_v1
+  timeout_minutes: 30
+
+novelty:
+  model: opus-5.5
+  effort: high
+  agents: 2
+  prompt: novelty_v3     # v3: reads the rubric; an idea is judged by its planned contribution; checks listed methods
+  lenses: true
+  per_agent:
+    1: {lens: direct_and_recent}
+    2: {lens: equivalents_and_gaps}
+  tools: [web_search, web_fetch, literature, prior_text]
+  paper_format: text
+  timeout_minutes: 90
+
+rigor:
+  model: fable-5.1
+  effort: max
+  agents: 1
+  prompt: rigor_v2       # v2: reads the rubric; theorem targets checked against the submission's own bounds
+  lenses: false          # one refuter with the full rigor remit, as in the earlier pass
+  tools: []
+  paper_format: text
+  timeout_minutes: 150
+
+fit:
+  model: opus-5.5
+  effort: high
+  agents: 1
+  prompt: fit_v2         # v2: reads the rubric; for an idea, the fatal criterion is about its planned tests
+  lenses: true
+  per_agent:
+    1: {lens: fit_overall}
+  tools: []
+  paper_format: text
+  timeout_minutes: 90
+
+verifier:
+  enabled: true
+  routing: cross_model
+  counterpart: {opus-5.5: fable-5.1, fable-5.1: opus-5.5}
+  model: opus-5.5
+  effort: high
+  prompt: verifier_v2     # v2: overlap quotes must come from inside the passage shown (check_quote says so)
+  tools: [prior_text]
+  paper_format: text
+  timeout_minutes: 45
+  max_agents_per_batch: 3
+  max_agents_per_run: 3
+  max_papers_per_run: 3
+  max_papers_per_followup_round: 2
+  max_agents_per_followup_round: 2
+  max_papers_per_user_batch: 2
+  max_agents_per_user_batch: 2
+  auto_gate_batch: true   # after the judges: one gate batch for objections they escalated that were never requested
+  blocking: false
+
+judge:
+  model: fable-5.1
+  effort: max
+  agents: 2              # 2026-10-02: two judges (was three)
+  prompt: judge_v3       # v3: member_severity in grouped judgments, rubric_rulings on declared rubric tests, tool sentence
+  lenses: false
+  tools: []
+  paper_format: text
+  timeout_minutes: 150
+
+synthesis:
+  model: fable-5.1
+  effort: max
+  agents: 1
+  prompt: synthesis_v4   # v4: cites the claims ledger by L IDs
+  tools: []
+  paper_format: text
+  timeout_minutes: 150
+
+critic:
+  model: fable-5.1
+  effort: xhigh
+  agents: 1
+  prompt: critic_v3      # v3: novelty_to_verify items quote the submission's own words (submission_quote)
+  tools: []
+  paper_format: text
+  timeout_minutes: 150
+
+plan_limit:
+  model_window_reserve: 0.15   # K1 pilot: one run used 15% of Fable 5.1's weekly window (seven_day_overage_included)
+
+followup:
+  auto_start: true
+  auto_continue: false
+  max_rounds: 1
+  min_severity: MAJOR_FIXABLE
+  adjudicators: 2
+  adjudicator:
+    model: fable-5.1
+    effort: max
+    per_agent:               # 2026-10-02: one adjudicator on each model (were two Fable 5.1 max)
+      1: {model: opus-5.5, effort: high}
+      2: {model: fable-5.1, effort: max}
+    prompt: adjudicator_v2   # v2: disputes of computed verdicts settled in objection_updates; one covered objection
+    paper_format: text
+    timeout_minutes: 150
+  revision:
+    model: fable-5.1
+    effort: max
+    prompt: synthesis_revision_v2
+    timeout_minutes: 150
+  recheck:
+    model: fable-5.1
+    effort: high           # 2026-10-02: high (was xhigh)
+    prompt: critic_recheck_v2
+    timeout_minutes: 150

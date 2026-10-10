@@ -17,9 +17,11 @@ from paper_adversary.config import (
     check_config,
     load_config,
     plan_agents,
+    preset_description,
+    rubric_test_issues,
 )
 from paper_adversary.ingest import ingest
-from paper_adversary.isolation import IsolationGuard, input_changed
+from paper_adversary.isolation import IsolationGuard
 from paper_adversary import followup
 from paper_adversary.pipeline import (
     RUNNABLE,
@@ -28,11 +30,15 @@ from paper_adversary.pipeline import (
     build_matrix,
     check_preconditions,
     finish_batch,
+    model_windows,
+    record_plan_windows,
+    stale_agents,
     supersede_memo,
 )
 from paper_adversary.reports import SEVERITY_RANK
 from paper_adversary.prompts import load_prompt, load_rubric
 from paper_adversary.providers import make_provider
+from paper_adversary.providers.base import MODEL_WINDOWS
 from paper_adversary.registry import ModelRegistry
 from paper_adversary.reports import read_report
 from paper_adversary.store import RunStore, list_runs
@@ -70,8 +76,12 @@ ROLE_ALIASES = {
 
 def create_run(paper_path: str | None = None, paper_text: str | None = None, title: str | None = None,
                venue: str | None = None, field: str | None = None, rubric: str | None = None,
-               config_override=None, submission_type: str = "auto") -> dict:
-    cfg, raw = load_config(config_override)
+               config_override=None, submission_type: str = "auto", preset: str | None = None,
+               trusted_config=None, evaluation: dict | None = None) -> dict:
+    """Ingest a submission and plan its agents. `preset` picks a selectable preset (per run, like
+    config_override); `trusted_config` is merged as trusted settings and is only for the CLI's --trusted-config,
+    never for anything a model chooses."""
+    cfg, raw = load_config(config_override, trusted_config, preset)
     registry = ModelRegistry.load()
     issues = check_config(cfg, registry)
     errors = [i for i in issues if i.level == "error"]
@@ -82,6 +92,7 @@ def create_run(paper_path: str | None = None, paper_text: str | None = None, tit
         rubric_label, rubric_text = load_rubric(rubric)  # validated once; the run keeps its own copy
         if not rubric_text:
             raise ConfigError(f"rubric '{rubric}' is empty or not found")
+        issues += rubric_test_issues(rubric_text, cfg.judge.prompt, "rubric (this run's)")
     result = ingest(paper_path, paper_text, submission_type)
 
     root = runs_root()
@@ -122,7 +133,11 @@ def create_run(paper_path: str | None = None, paper_text: str | None = None, tit
         "prompts": prompts,
         "provider": cfg.provider.type,
         "package_version": __version__,
+        "preset": cfg.preset,
+        "preset_description": preset_description(cfg.preset) if cfg.preset else None,
     }
+    if evaluation:
+        metadata["evaluation"] = evaluation
     store = RunStore.create(root, run_id, metadata, raw)
     src = store.source_dir
     atomic_write_text(src / "extracted_text.md", result.text_md)
@@ -142,6 +157,8 @@ def create_run(paper_path: str | None = None, paper_text: str | None = None, tit
     metadata["source"] = source
     store.save_metadata(metadata)
     store.init_state([s.state_entry() for s in specs], verification=bool(cfg.verifier and cfg.verifier.enabled))
+    assignment = resolved_assignment(cfg, specs, registry)
+    atomic_write_json(store.dir / "assignment.json", assignment)
     store.event("run_created", title=metadata["title"], agents=len(specs), source_format=result.source_format)
     return {
         "run_id": run_id,
@@ -151,9 +168,39 @@ def create_run(paper_path: str | None = None, paper_text: str | None = None, tit
         "warnings": result.warnings + [str(i) for i in issues if i.level == "warning"],
         "agents": [s.public() for s in specs],
         "prompt_versions": prompts,
-        "verifier": ({"model": registry.resolve(cfg.verifier.model).id, "effort": cfg.verifier.effort,
-                      "prompt": cfg.verifier.prompt, "max_agents_per_batch": cfg.verifier.max_agents_per_batch}
-                     if cfg.verifier and cfg.verifier.enabled else None),
+        "verifier": assignment["verifier"],
+        "followup": assignment["followup"],
+        "preset": cfg.preset,
+        "preset_description": metadata["preset_description"],
+    }
+
+
+def resolved_assignment(cfg, specs, registry: ModelRegistry) -> dict:
+    """Who does what in this run, resolved when it is created (written to assignment.json). Resuming uses the
+    run's own state and config.yaml, so later edits to a preset never change a run that exists."""
+    vc, fc = cfg.verifier, cfg.followup
+    rid = lambda alias: registry.resolve(alias).id  # noqa: E731
+    return {
+        "preset": cfg.preset,
+        "lens_set": cfg.lens_set,
+        "agents": [{"agent_id": s.agent_id, "role": s.role, "model": s.model_id, "model_alias": s.model_alias,
+                    "effort": s.effort, "prompt": s.prompt_name, "lens": (s.lens or {}).get("id")} for s in specs],
+        "verifier": ({"routing": vc.routing, "model": rid(vc.model), "effort": vc.effort, "prompt": vc.prompt,
+                      "counterpart": {rid(a): rid(b) for a, b in vc.counterpart.items()},
+                      "max_papers_per_run": vc.max_papers_per_run, "max_agents_per_run": vc.max_agents_per_run,
+                      "max_agents_per_batch": vc.max_agents_per_batch} if vc and vc.enabled else None),
+        "followup": ({"max_rounds": fc.max_rounds, "auto_start": fc.auto_start, "auto_continue": fc.auto_continue,
+                      "min_severity": fc.min_severity,
+                      "adjudicators": [{"position": k, "model": rid(m), "effort": e}
+                                       for k, (m, e, _) in ((k, fc.adjudicator.for_agent(k))
+                                                            for k in range(1, fc.adjudicators + 1))],
+                      "revision": {"model": rid(fc.revision.model), "effort": fc.revision.effort},
+                      "recheck": {"model": rid(fc.recheck.model), "effort": fc.recheck.effort}} if fc else None),
+        "format_repair": {"model": rid(cfg.gates.repair.model) if cfg.gates.repair.model != "agent" else "agent",
+                          "effort": cfg.gates.repair.effort},
+        "plan_limit": {"policy": cfg.plan_limit.policy, "max_waits_per_run": cfg.plan_limit.max_waits_per_run,
+                       "max_wait_hours": cfg.plan_limit.max_wait_hours,
+                       "model_window_reserve": cfg.plan_limit.model_window_reserve},
     }
 
 
@@ -169,6 +216,8 @@ def format_created(info: dict) -> str:
         f"Source: {src['format']}, {src.get('pages') or '?'} pages, {src['words']:,} words (~{src['est_tokens']:,} "
         f"tokens est.), {src['sections']} sections, {src['references']} references parsed",
         f"Rubric: {md.get('rubric')}",
+        f"Preset: {info.get('preset') or 'none (saved configuration)'}"
+        + (f" — {info['preset_description']}" if info.get("preset_description") else ""),
         "",
         "Planned agents:",
     ]
@@ -182,16 +231,27 @@ def format_created(info: dict) -> str:
         a0 = agents[0]
         tools = f", tools: {', '.join(a0['tools'])}" if a0["tools"] else ""
         fmt = ", gets the PDF" if a0["paper_format"] == "pdf" and src["format"] == "pdf" else ""
-        lenses = [a["lens"] for a in agents if a.get("lens")]
-        lines.append(f"  {STAGE_LABEL[role]}: {len(agents)} × {a0['model']} (effort {a0['effort']}), prompt "
-                     f"{a0['prompt']}{tools}{fmt}")
-        for a, lens in zip(agents, lenses):
-            lines.append(f"      {a['agent_id']}: {lens}")
+        same = len({(a["model"], a["effort"]) for a in agents}) == 1
+        head = f"{len(agents)} × {a0['model']} (effort {a0['effort']})" if same else f"{len(agents)} agents"
+        lines.append(f"  {STAGE_LABEL[role]}: {head}, prompt {a0['prompt']}{tools}{fmt}")
+        for a in agents:
+            if not same or a.get("lens"):
+                lines.append(f"      {a['agent_id']}: " + ("" if same else f"{a['model']} ({a['effort']})")
+                             + (" — " if not same and a.get("lens") else "") + (a.get("lens") or ""))
     verifier = info.get("verifier")
     if verifier:
-        lines.append(f"  {STAGE_LABEL['verifier']}: up to {verifier['max_agents_per_batch']} × {verifier['model']} "
-                     f"(effort {verifier['effort']}), prompt {verifier['prompt']}; planned after the refuters, one "
-                     "per prior paper behind a decisive novelty objection")
+        route = (", on the other model than the objection's author ("
+                 + "; ".join(f"{a} → {b}" for a, b in verifier["counterpart"].items()) + ")"
+                 if verifier["routing"] == "cross_model" and verifier["counterpart"] else f" on {verifier['model']}")
+        lines.append(f"  {STAGE_LABEL['verifier']}: one per prior paper behind a decisive novelty objection{route}, "
+                     f"effort {verifier['effort']}; at most {verifier['max_papers_per_run']} prior papers per run")
+    fu = info.get("followup")
+    if fu and fu["max_rounds"]:
+        lines.append(f"  Follow-up: up to {fu['max_rounds']} round(s) when the critic raises an item at "
+                     f"{fu['min_severity']} or above; adjudicators "
+                     + ", ".join(f"{a['model']} ({a['effort']})" for a in fu["adjudicators"])
+                     + f"; revised memo {fu['revision']['model']} ({fu['revision']['effort']}); re-check "
+                     f"{fu['recheck']['model']} ({fu['recheck']['effort']})")
     if info["warnings"]:
         lines += ["", "Warnings:"] + [f"  - {w}" for w in info["warnings"]]
     return "\n".join(lines)
@@ -227,7 +287,7 @@ def _agent_desc(a: dict, run_state: str) -> str:
         desc += f"  attempt {a.get('attempts', 1)}{elapsed}"
     elif status in ("retrying", "waiting_plan_limit", "failed", "interrupted", "gating", "quarantined") \
             and a.get("detail"):
-        desc += f"  {a['detail'][:220]}"
+        desc += f"  {a['detail'][:300]}"
     if status == "complete":
         gate = a.get("gate") or {}
         if a.get("release"):
@@ -236,6 +296,8 @@ def _agent_desc(a: dict, run_state: str) -> str:
             desc += "  [not gated: created before gates existed]"
         elif gate.get("warnings"):
             desc += f"  [gate: {len(gate['warnings'])} warning(s)]"
+    if a.get("superseded_by"):
+        desc += f"  (superseded by {a['superseded_by']})"
     return desc
 
 
@@ -248,48 +310,71 @@ def run_state_label(state: dict, worker: dict) -> str:
     return "idle"
 
 
-def stale_agents(store: RunStore, state: dict) -> dict[str, list[str]]:
-    """Complete agents whose inputs changed, became unusable (quarantined), or became available after they ran."""
-    stale: dict[str, list[str]] = {}
-    agents = state.get("agents", {})
-    for aid, a in agents.items():
-        if a["status"] != "complete":
-            continue
-        ctx = read_json(store.sidecar_path(aid, a["role"], ".context.json"), {}) or {}
-        reasons = [str(m.get("agent_id") or m.get("path")) for m in ctx.get("manifest", []) if input_changed(store, m)]
-        used = {m.get("agent_id") for m in ctx.get("manifest", []) if m.get("agent_id")}
-        reasons += [f"{u} is now {agents[u]['status']}" for u in sorted(used)
-                    if u in agents and agents[u]["status"] == "quarantined"]
-        reasons += [f"{m} became available after it ran" for m in ctx.get("missing_agents") or []
-                    if m in agents and agents[m]["status"] == "complete"]
-        if reasons:
-            stale[aid] = list(dict.fromkeys(reasons))
-    return stale
-
-
 def plan_usage_line(info: dict | None) -> str:
-    """Plan windows as Claude Code last reported them (rate_limit_event)."""
+    """Plan windows as Claude Code last reported them (rate_limit_event). A model-specific window
+    (seven_day_overage_included, which only Fable calls report) is labelled with its model, from the call that last
+    reported it, e.g. "Fable 5.1 (model-specific) weekly window"."""
     if not info:
         return ""
     import datetime as _dt
 
-    parts = []
-    for name, window in (info.get("unifiedWindows") or {}).items():
-        if not isinstance(window, dict):
-            continue
+    def window_text(label: str, window: dict) -> str:
         used = window.get("utilization")
         resets = window.get("resetsAt")
         when = (_dt.datetime.fromtimestamp(resets, _dt.timezone.utc).astimezone().strftime("%a %H:%M")
                 if isinstance(resets, (int, float)) else "?")
         pct = f"{used * 100:.0f}%" if isinstance(used, (int, float)) else "?"
-        parts.append(f"{name.replace('_', '-')} {pct} used (resets {when})")
+        return f"{label} {pct} used (resets {when})"
+
+    per_model = info.get("model_windows") or {}
+    attributed = {name for windows in per_model.values() for name in windows or {}}
+    parts = []
+    for name, window in (info.get("unifiedWindows") or {}).items():
+        if not isinstance(window, dict) or name in attributed:
+            continue
+        label = (f"model-specific {MODEL_WINDOWS[name]} window ({name})" if name in MODEL_WINDOWS
+                 else name.replace("_", "-"))
+        parts.append(window_text(label, window))
+    registry = ModelRegistry.load() if per_model else None
+    for model, windows in sorted(per_model.items()):
+        found = registry.by_id(model) if registry else None
+        who = ((found.display_name if found else "") or "").removeprefix("Claude ") or model
+        for name, window in sorted((windows or {}).items()):
+            parts.append(window_text(f"{who} (model-specific) {MODEL_WINDOWS.get(name, name)} window", window))
     overage = "on" if info.get("isUsingOverage") or info.get("overageStatus") == "allowed" else "off"
     status = "" if info.get("status") in (None, "allowed") else f"; status {info.get('status')}"
     return (f"Plan usage (as of {local_hm(info.get('observed_at'))}): " + ", ".join(parts)
             + f"; paid overage {overage}{status}") if parts else ""
 
 
-def next_step(state: dict, label: str, followup_configured: bool = False) -> str:
+def search_health_line(health: dict | None) -> str:
+    """Which literature providers answered the refuters (pipeline.search_health), in one line."""
+    if not health:
+        return ""
+    providers = health.get("providers") or {}
+    lost = [(n, p) for n, p in sorted(providers.items()) if p.get("unavailable")]
+    if not lost:
+        calls = max((p.get("calls") or 0 for p in providers.values()), default=0)
+        return f"Literature search: every provider answered the refuters' calls ({calls} calls)"
+    degraded = set(health.get("degraded") or [])
+    parts = [f"{n} unavailable for {p['unavailable']} of {p['calls']} calls ({p['unavailable'] / p['calls']:.0%}"
+             + (f", {local_hm(p.get('first_unavailable'))}–{local_hm(p.get('last_unavailable'))[-5:]}"
+                if p.get("first_unavailable") else "") + ")" + (" DEGRADED" if n in degraded else "")
+             for n, p in lost]
+    return ("Literature search (refuters' logs): " + "; ".join(parts)
+            + ("; judges, memo and critic are told" if degraded else ""))
+
+
+def _unverified_recheck_items(store: RunStore, r: int) -> list[str]:
+    """The last round's re-check items that name suspected prior work no round will verify (see recheck_line)."""
+    record = read_json(followup.round_dir(store, r) / "round.json") or {}
+    if record.get("outcome") in (None, "another_round"):
+        return []
+    return [x["id"] for x in (record.get("new_items") or []) + (record.get("below_floor") or [])
+            if x.get("type") == "novelty_to_verify"]
+
+
+def next_step(state: dict, label: str, followup_configured: bool = False, store: RunStore | None = None) -> str:
     if label == "running":
         return "Wait, or poll get_run_status(run_id, wait_seconds=50). cancel_run stops the worker."
     agents = state["agents"]
@@ -301,6 +386,11 @@ def next_step(state: dict, label: str, followup_configured: bool = False) -> str
         return (f"Quarantined: {', '.join(quarantined)}. Read get_report(run_id, 'gates', agent_id) for the "
                 f"reasons, then {how} or, if the reason does not hold, release them with a recorded reason "
                 "(release_quarantine; isolation reasons need the CLI: paper-adversary release).")
+    last_job = state.get("last_job") or {}
+    if last_job.get("outcome") == "incomplete" and "resume_run continues after the reset" in (last_job.get("message")
+                                                                                             or ""):
+        return ("Stopped at a plan limit (the state line above says which, and when it resets): resume_run(run_id) "
+                "after the reset continues where the job stopped.")
     for stage, tool in (("novelty", "run_refuters"), ("rigor", "run_refuters"), ("fit", "run_refuters"),
                         ("judge", "run_judges"), ("synthesis", "run_synthesis"),
                         ("critic", "run_completeness_critic")):
@@ -318,21 +408,49 @@ def next_step(state: dict, label: str, followup_configured: bool = False) -> str
     if last and last.get("outcome") == "another_round":
         return ("Review complete; the re-check critic raised new serious items. run_followup(run_id, dry_run=true) "
                 "shows the next round. The current memo is get_report(run_id, 'memo').")
+    unverified = _unverified_recheck_items(store, len(rounds)) if store is not None and rounds else []
+    tail = (f" Suspected prior work in re-check items was never verified: {', '.join(unverified)}; "
+            "run_verification(run_id, from_gate=false, requests=[{prior, claim_quote}]) checks such pairs."
+            if unverified else "")
     if last and last.get("outcome") == "max_rounds_reached" and last.get("new_items"):
         return (f"Review complete. The round cap was reached while the re-check critic still raised new serious "
-                f"items ({', '.join(last['new_items'])}); they are not in the current memo. Read "
-                "get_report(run_id, 'memo') and get_report(run_id, 'recheck').")
+                f"items ({', '.join(last['new_items'])}); they are not in the current memo, and those rated MAJOR "
+                "BUT FIXABLE or FATAL count as open issues. Read get_report(run_id, 'memo') and "
+                "get_report(run_id, 'recheck')." + tail)
     if last and last.get("outcome") == followup.SATURATED:
         return ("Review complete, with open issues (listed above under the follow-up round): standing FATAL "
-                "verdicts, unverified FATAL prior-work threats, or items the re-check critic re-raised. Not ready for "
-                "the next gate. The current memo, get_report(run_id, 'memo'), says what to fix or check.")
+                "verdicts, unverified FATAL prior-work threats, items the re-check critic re-raised, or serious new "
+                "items no round adjudicated. Not ready for the next gate. The current memo, get_report(run_id, "
+                "'memo'), says what to fix or check." + tail)
     if last and last.get("outcome") == followup.READY:
         return ("Review complete and ready for the next gate: nothing serious is open. Read get_report(run_id, "
-                "'memo'), the current memo; its open MAJOR BUT FIXABLE issues still need fixing.")
+                "'memo'), the current memo; its open MAJOR BUT FIXABLE issues still need fixing." + tail)
     return ("Review complete. Read get_report(run_id, 'memo') (the current memo) and get_report(run_id, 'critic'); "
             "the judgment matrix is get_report(run_id, 'matrix')."
             + (" run_followup(run_id, dry_run=true) shows what a follow-up round would do."
                if followup_configured and not rounds else ""))
+
+
+def _gate_line(store: RunStore, state: dict, gate: dict) -> str:
+    """The evidence gate's status line: what is not shown, which of it is serious only through grouped verdicts,
+    and which the adjudicators have since re-rated below serious (the gate itself is not recomputed for that)."""
+    flagged = gate.get("flagged_ids") or []
+    if not flagged:
+        return "Evidence gate: every serious prior-work verdict is shown"
+    line = f"Evidence gate: not shown: {', '.join(flagged)} (listed under 'Unverified threats')"
+    grouped = [i for i in gate.get("flagged_grouped_only") or [] if i in flagged]
+    if grouped:
+        line += f"; serious only through grouped verdicts (judges ruling on them alone rated them lower): " \
+                f"{', '.join(grouped)}"
+    rounds = (state.get("followup") or {}).get("rounds") or {}
+    last = read_json(followup.round_dir(store, max(int(k) for k in rounds)) / "round.json") if rounds else None
+    issues = (last or {}).get("open_issues") or {}
+    serious = {x["id"] for x in (issues.get("major") or []) + (issues.get("blocking") or {}).get("fatal", [])
+               + (issues.get("blocking") or {}).get("unverified_fatal", [])}
+    down = [i for i in flagged if i in (issues.get("overturned") or {}) and i not in serious]
+    if down:
+        line += f"; re-rated below serious by every adjudicator since: {', '.join(down)}"
+    return line
 
 
 def status_text(run: str) -> str:
@@ -343,6 +461,8 @@ def status_text(run: str) -> str:
     label = run_state_label(state, worker)
     title = meta.get("title") or (meta.get("intake") or {}).get("title")
     lines = [f"Run: {store.run_id}" + (f' — "{title}"' if title else "")]
+    if meta.get("preset"):
+        lines.append(f"Preset: {meta['preset']}")
     if label == "running":
         lines.append(f"State: running (worker pid {worker.get('pid')}, started {local_hm(worker.get('started_at'))}, "
                      f"stages {', '.join(worker.get('stages') or [])})")
@@ -359,11 +479,17 @@ def status_text(run: str) -> str:
     plan = plan_usage_line(state.get("plan_usage"))
     if plan:
         lines.append(plan)
+    search = search_health_line(state.get("search_health"))
+    if search:
+        lines.append(search)
+    for w in (state.get("preflight") or {}).get("warnings") or []:
+        lines.append(f"Preflight warning ({local_hm(w['at'])}): {w.get('message')}" if w.get("at")
+                     else f"Preflight warning: {w.get('message')}")
     lines.append("")
     agents = state.get("agents", {})
     for role in STAGE_ORDER:
-        members = sorted((aid for aid, a in agents.items() if a["role"] == role),
-                         key=lambda x: (len(x), x))
+        members = sorted((aid for aid, a in agents.items() if a["role"] == role  # follow-up verifiers: their round
+                          and not (role == "verifier" and int(a.get("round") or 0))), key=lambda x: (len(x), x))
         if not members:
             continue
         if role in ("synthesis", "critic", "intake") and len(members) == 1:
@@ -376,12 +502,10 @@ def status_text(run: str) -> str:
         lines.append(f"Blind verification ({batch_id}): {batch.get('status')}"
                      + (f" — {len(batch.get('requests') or [])} request(s): {counts}" if counts else "")
                      + (f"; {batch['reason']}" if batch.get("reason") else ""))
-    lines += followup.round_summary(store, state)
+    lines += followup.round_summary(store, state, describe=lambda aid: _agent_desc(agents[aid], label))
     gate = read_json(store.role_dir("judge") / "evidence_gate.json")
     if gate:
-        flagged = gate.get("flagged_ids") or []
-        lines.append("Evidence gate: " + (f"not shown: {', '.join(flagged)} (listed under 'Unverified threats')"
-                                          if flagged else "every serious prior-work verdict is shown"))
+        lines.append(_gate_line(store, state, gate))
     failures = [(aid, f) for aid, a in agents.items() for f in a.get("failures") or []]
     lines.append("")
     if failures:
@@ -424,19 +548,22 @@ def status_text(run: str) -> str:
     lines += ["", f"Artifacts: {store.dir}"]
     for role in STAGE_ORDER:
         for aid in sorted(a for a, v in agents.items() if v["role"] == role and v["status"] == "complete"):
-            lines.append(f"  {store.rel(store.report_path(aid, role))}")
+            lines.append(f"  {store.rel(store.report_path(aid, role))}"
+                         + (f" ({aid}, superseded by {agents[aid]['superseded_by']})"
+                            if agents[aid].get("superseded_by") else ""))
         if role == "judge" and (store.role_dir("judge") / "judgment_matrix.md").exists():
             lines.append("  judges/judgment_matrix.md")
     for k, rnd in sorted(((state.get("followup") or {}).get("rounds") or {}).items(), key=lambda kv: int(kv[0])):
         for aid in (rnd.get("adjudicators") or []) + [rnd.get("revision"), rnd.get("recheck")]:
             a = agents.get(aid) if aid else None
             if a and a["status"] == "complete":
-                lines.append(f"  {store.rel(store.report_path(aid, a['role']))}")
+                lines.append(f"  {store.rel(store.report_path(aid, a['role']))}"
+                             + (f" ({aid}, superseded by {a['superseded_by']})" if a.get("superseded_by") else ""))
         if (store.dir / "followup" / f"round-{k}" / "followup_matrix.md").exists():
             lines.append(f"  followup/round-{k}/items.md, followup/round-{k}/followup_matrix.md")
     configured = bool(store.load_raw_config().get("followup"))
     lines += ["  logs/events.jsonl, logs/usage.jsonl, logs/api_usage.json", "",
-              "Next: " + next_step(state, label, configured)]
+              "Next: " + next_step(state, label, configured, store)]
     return "\n".join(lines)
 
 
@@ -721,32 +848,40 @@ def release_quarantine(run: str, agent_id: str, reason: str, via: str = "cli") -
 
 
 def verification_batch(run: str, from_gate: bool, requests: list[dict] | None) -> tuple[str, int]:
-    """Write a request file for a new verification batch; the worker plans and runs it. Returns (id, count)."""
+    """Write a request file for a new verification batch; the worker plans and runs it. Returns (id, count).
+    Each gate or user batch has its own budget (verifier.max_papers_per_user_batch, max_agents_per_user_batch);
+    a batch that could start no verifier is refused here, before anything is fetched."""
     store = RunStore.open(run)
     state = store.load_state()
     if state.get("verification") is None:
         raise ValueError("this run was created without blind verification (verifier disabled in its config)")
+    vc = store.load_config().verifier
+    if vc is None or not vc.enabled:
+        raise ValueError("blind verification is turned off in this run's config")
+    for key in ("max_papers_per_user_batch", "max_agents_per_user_batch", "max_agents_per_batch"):
+        if getattr(vc, key) <= 0:
+            raise ValueError(f"verifier.{key} is 0 for this run, so a gate or user batch could start no verifier. "
+                             "It is a trusted limit that no tool call can raise: set it in the run's config.yaml "
+                             "from a terminal")
     batches = (state["verification"].get("batches") or {})
     prefix = "gate" if from_gate else "user"
-    batch_id = f"{prefix}{1 + sum(1 for b in batches if b.startswith(prefix))}"
+    taken = set(batches) | {state["verification"].get("auto_gate")}  # the automatic gate batch may be unplanned
+    batch_id = next(f"{prefix}{n}" for n in range(1, len(taken) + 2) if f"{prefix}{n}" not in taken)
     out: list[dict] = []
     if from_gate:
         from dataclasses import asdict
 
-        from paper_adversary.verification import requests_from_objections
+        from paper_adversary.verification import gate_requests
 
         gate = read_json(store.role_dir("judge") / "evidence_gate.json") or {}
         flagged = set(gate.get("flagged_ids") or [])
-        results = (read_json(store.role_dir("verifier") / "results.json", {}) or {}).get("requests") or {}
-        for req in requests_from_objections(store, state):  # the objections as they are now
-            done = results.get(req.request_id) or {}
-            answered = done.get("origin_hash") == req.origin_hash and done.get("status") in (
-                "verified", "disputed", "cannot_tell")
-            if set(req.origin_ids) & flagged and not answered:
-                out.append({**asdict(req), "origin_ids": list(req.origin_ids)})
+        # the objections as they are now; flagged ones whatever their refuter's severity (judges may escalate);
+        # references past the per-objection limit are only recorded as not run, never fetched
+        out = [{**asdict(req), "origin_ids": list(req.origin_ids)} for req in gate_requests(store, state, flagged)]
         if not out:
             raise ValueError("nothing to re-check: every flagged verdict already has a verifier's answer for its "
-                             "current objection, or none is flagged (see get_report(run_id, 'evidence_gate'))")
+                             "current objection, cites no reference that can be checked, or none is flagged (see "
+                             "get_report(run_id, 'evidence_gate'))")
     for i, req in enumerate(requests or [], start=1):
         ident = str(req.get("prior") or req.get("identifier") or "").strip()
         if not ident or not (req.get("claim_quote") or req.get("claim_location")):
@@ -778,15 +913,17 @@ async def add_prior_fulltext(run: str, identifier: str, path: str, title: str | 
             "verdicts that waited on it.")
 
 
-def resume_stages(state: dict, through: str = "critic") -> list[str]:
-    """Stages that still have work (runnable agents, or outputs whose checks did not finish), up to `through`.
-    With through="followup", an unfinished follow-up round (or the next one, if the last asked for it) too."""
+def resume_stages(state: dict, through: str = "critic", stale: dict | None = None) -> list[str]:
+    """Stages that still have work (runnable agents, outputs whose checks did not finish, or, given `stale`,
+    outputs whose inputs changed), up to `through`. With through="followup", an unfinished follow-up round (or
+    the next one, if the last asked for it) too."""
     last = {"refuters": "fit", "judges": "judge", "synthesis": "synthesis", "critic": "critic",
             "followup": "critic"}[through]
     upto = STAGE_ORDER[: STAGE_ORDER.index(last) + 1]
     agents = [a for a in state.get("agents", {}).values() if not int(a.get("round") or 0)]
-    stages = [s for s in upto if any(a["role"] == s and (a["status"] in RUNNABLE or a["status"] == "gating")
-                                     for a in agents)]
+    stale = stale or {}
+    stages = [s for s in upto if any(a["role"] == s and (a["status"] in RUNNABLE or a["status"] == "gating"
+                                                         or a["agent_id"] in stale) for a in agents)]
     if through == "followup":
         rounds = (state.get("followup") or {}).get("rounds") or {}
         unfinished = any(v.get("status") != "complete" for v in rounds.values()) or \
@@ -840,16 +977,23 @@ def followup_plan(run: str) -> str:
     if not items:
         return f"Nothing to follow up: {critic_id} raised no structured items."
     floor = SEVERITY_RANK.get(fc.min_severity, 2)
-    serious = [i for i in items if SEVERITY_RANK.get(i.get("severity") or "", -1) >= floor]
+    rows = {row["id"]: row for row in (read_json(store.role_dir("judge") / "judgment_matrix.json", {}) or {})
+            .get("rows") or []}
+    serious = [i for i in items if SEVERITY_RANK.get(i.get("severity") or "", -1) >= floor
+               or followup._disputed(i, rows)]  # disputes of serious verdicts are adjudicated too (triage)
     refs = [i for i in items if i.get("candidate_references")]
     registry = ModelRegistry.load()
+    vround = cfg.verifier.max_agents_per_followup_round if cfg.verifier else 0  # the round's own verifier budget
     lines = [f"Follow-up round {r} on {critic_id}'s {len(items)} item(s): {len(serious)} at or above "
-             f"{fc.min_severity} go to {fc.adjudicators} adjudicators; {len(refs)} name prior work to verify.",
-             f"Agents: {fc.adjudicators} × {registry.resolve(fc.adjudicator.model).id} ({fc.adjudicator.effort}), "
-             f"revised memo S{followup.next_free(state, 'S')} on {registry.resolve(fc.revision.model).id} "
+             f"{fc.min_severity} (or disputing a serious verdict) go to {fc.adjudicators} adjudicators; {len(refs)} "
+             "name prior work to verify.",
+             "Agents: adjudicators " + ", ".join(
+                 f"{registry.resolve(m).id} ({e})" for m, e, _ in (fc.adjudicator.for_agent(k)
+                                                               for k in range(1, fc.adjudicators + 1)))
+             + f"; revised memo S{followup.next_free(state, 'S')} on {registry.resolve(fc.revision.model).id} "
              f"({fc.revision.effort}), re-check C{followup.next_free(state, 'C')} on "
              f"{registry.resolve(fc.recheck.model).id} ({fc.recheck.effort})"
-             + (f", plus up to {min(len(refs), cfg.verifier.max_agents_per_batch)} blind verifier(s)"
+             + (f", plus up to {min(len(refs), cfg.verifier.max_agents_per_batch, vround)} blind verifier(s)"
                 if refs and cfg.verifier and cfg.verifier.enabled else "") + ".",
              "Each of these reads about as much as the completeness critic did (the whole review)."]
     if not serious and not refs:
@@ -894,10 +1038,10 @@ def claude_version(binary: str) -> str | None:
         return None
 
 
-async def validate_text(config_override=None, probe_models: bool = False) -> str:
+async def validate_text(config_override=None, probe_models: bool = False, preset: str | None = None) -> str:
     lines = []
     try:
-        cfg, raw = load_config(config_override)
+        cfg, raw = load_config(config_override, None, preset)
     except ConfigError as exc:
         return f"Config: INVALID\n{exc}"
     registry = ModelRegistry.load()
@@ -907,16 +1051,20 @@ async def validate_text(config_override=None, probe_models: bool = False) -> str
     lines += [f"  {i}" for i in issues]
     specs = plan_agents(cfg, registry)
     lines.append("")
+    lines.append(f"Preset: {cfg.preset}")
     lines.append("Resolved roles (alias -> model ID, effort):")
     seen = set()
     for s in specs:
         if s.role in seen:
             continue
         seen.add(s.role)
-        n = sum(1 for x in specs if x.role == s.role)
-        info = registry.resolve(s.model_id)
-        lines.append(f"  {STAGE_LABEL[s.role]:<22} {n} × {s.model_alias} -> {s.model_id} ({s.effort})"
-                     + ("" if info.known else "  [not in models.yaml]"))
+        group: dict[tuple[str, str, str], list[str]] = {}
+        for x in specs:
+            if x.role == s.role:
+                group.setdefault((x.model_alias, x.model_id, x.effort), []).append(x.agent_id)
+        lines.append(f"  {STAGE_LABEL[s.role]:<22} " + "; ".join(
+            f"{len(ids)} × {alias} -> {mid} ({effort})" + ("" if registry.resolve(mid).known else " [not in models.yaml]")
+            for (alias, mid, effort), ids in group.items()))
     lines.append(f"Total agents per full run: {len(specs)}; parallel limit {cfg.concurrency.max_parallel_agents}")
     provider = make_provider(cfg.provider)
     lines.append("")
@@ -943,6 +1091,7 @@ async def validate_text(config_override=None, probe_models: bool = False) -> str
         lines.append("Probes (one tiny low-effort call per model and tool setup, on your plan):")
         probe_root = runs_root() / ".cache" / "probe_logs"
         last_plan: dict | None = None
+        per_model: dict[str, dict] = {}  # model-specific windows, by the model whose probe reported them
         setups: dict[tuple[str, tuple[str, ...]], list[str]] = {}
         for s in specs:
             tools = [t for t in s.tools if not (t == "web_search" and not cfg.search.web_search)
@@ -951,8 +1100,17 @@ async def validate_text(config_override=None, probe_models: bool = False) -> str
                 tools.append("read_pdf")
             setups.setdefault((s.model_id, tuple(sorted(tools))), []).append(s.role)
         if cfg.verifier and cfg.verifier.enabled:
-            setups.setdefault((registry.resolve(cfg.verifier.model).id, tuple(sorted(cfg.verifier.tools))),
-                              []).append("verifier")
+            for alias in {cfg.verifier.model, *cfg.verifier.counterpart.values()}:
+                setups.setdefault((registry.resolve(alias).id, tuple(sorted(cfg.verifier.tools))),
+                                  []).append("verifier")
+        if cfg.followup is not None and cfg.followup.max_rounds:
+            fc = cfg.followup
+            roles = [("adjudicator", fc.adjudicator.for_agent(k)[0], fc.adjudicator.paper_format)
+                     for k in range(1, fc.adjudicators + 1)]
+            roles += [("revision", fc.revision.model, fc.revision.paper_format),
+                      ("recheck", fc.recheck.model, fc.recheck.paper_format)]
+            for role, alias, fmt in roles:
+                setups.setdefault((registry.resolve(alias).id, ("read_pdf",) if fmt == "pdf" else ()), []).append(role)
         if cfg.gates.repair.model != "agent":
             setups.setdefault((registry.resolve(cfg.gates.repair.model).id, ()), []).append("repair")
         for (model, tools), roles in sorted(setups.items()):
@@ -966,6 +1124,10 @@ async def validate_text(config_override=None, probe_models: bool = False) -> str
             plan_info = (res.get("runtime") or {}).get("rate_limit") or res.get("rate_limit")
             if plan_info:
                 last_plan = plan_info
+                windows = model_windows(plan_info, utcnow_iso())
+                if windows:  # the next run's window guard sees it too (plan_limit.model_window_reserve)
+                    per_model[model] = windows
+                    record_plan_windows(model, windows)
             if res.get("ok"):
                 ctx = f", context window {res['context_window']:,}" if res.get("context_window") else ""
                 lines.append(f"  OK      {label} (served by {', '.join(res.get('served_models') or ['?'])}{ctx})")
@@ -974,7 +1136,7 @@ async def validate_text(config_override=None, probe_models: bool = False) -> str
             else:
                 lines.append(f"  FAILED  {label} — {res.get('error_kind')}: {res.get('error')}")
         if last_plan:
-            lines.append(plan_usage_line({**last_plan, "observed_at": utcnow_iso()}))
+            lines.append(plan_usage_line({**last_plan, "observed_at": utcnow_iso(), "model_windows": per_model}))
     else:
         lines.append("Model availability is checked by a probe when a run starts (validate_config(probe_models=True) "
                      "checks now).")

@@ -1,0 +1,37 @@
+# One evaluation case (see eval/README.md). Copy this folder to eval/cases/<id>/ and fill it in.
+#
+# status: template     not runnable (this file)
+#         synthetic    runnable, for testing the harness only; never evidence about quality or cost
+#         adjudicated  a real case whose ground truth a person wrote after reading the submission and evidence
+#
+# Never generate ground truth with a model, and never copy a review's output into it: the point of a case is
+# an independent human judgment to score reviews against.
+
+id: case_id                         # REQUIRED: a short file-stem-like name
+category: genuine_overlap           # REQUIRED: genuine_overlap | different_prior_work | valid_objection | incorrect_objection
+status: template
+title: null                         # optional; otherwise detected from the submission
+venue: ICML 2027
+submission: submission.md           # REQUIRED: the paper or idea under review (.pdf .md .tex .txt), relative to this file
+submission_type: auto               # paper | idea | auto
+
+evidence:                           # the fixed evidence pack: what both presets read in reasoning mode
+  - identifier: "arXiv:0000.00000"  # arXiv ID or DOI (the key reviews must cite)
+    title: "Title of the prior paper"
+    file: evidence/0000.00000.md    # extracted text (.md/.txt), or the original .pdf/.html (extracted once)
+
+ground_truth:                       # written by a person; leave empty in a template
+  adjudicated_by: null              # REQUIRED for status adjudicated
+  adjudicated_on: null              # YYYY-MM-DD
+  serious_issues: []                # what a good review must raise; each:
+    # - id: GT1
+    #   kind: prior_work            # prior_work | technical
+    #   severity: FATAL             # FATAL | MAJOR_FIXABLE
+    #   description: "Paper X already proposes the method of Sec. 3 (its Sec. 4.2)."
+    #   prior_work: ["arXiv:0000.00000"]   # prior_work issues: the anticipating paper(s)
+    #   location: "Sec. 3"                 # technical issues: where the problem is
+  not_fatal: []                     # accusations that would be wrong as FATAL; each:
+    # - id: NF1
+    #   description: "Paper Y looks similar but optimizes a different objective, so it does not anticipate C1."
+    #   prior_work: ["arXiv:1111.11111"]   # for prior-work cases: the similar-looking paper
+  notes: null

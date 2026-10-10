@@ -48,6 +48,13 @@ class _Strict(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class AgentOverride(_Strict):
+    """One agent's own model, effort or lens, over its role's defaults (role: {per_agent: {2: {...}}})."""
+    model: str | None = None
+    effort: str | None = None
+    lens: str | None = None  # a lens id from the run's lens set
+
+
 class RoleConfig(_Strict):
     model: str
     effort: str
@@ -58,6 +65,13 @@ class RoleConfig(_Strict):
     paper_format: Literal["text", "pdf"] = "text"
     timeout_minutes: float = Field(60, gt=0)
     max_turns: int | None = Field(None, ge=1)
+    per_agent: dict[int, AgentOverride] = Field(default_factory=dict)  # agent number (1-based) -> override
+
+    def for_agent(self, index: int) -> tuple[str, str, str | None]:
+        """(model alias, effort, explicit lens id or None) of agent `index`."""
+        ov = self.per_agent.get(index)
+        return ((ov.model if ov and ov.model else self.model), (ov.effort if ov and ov.effort else self.effort),
+                ov.lens if ov else None)
 
 
 class OrchestratorConfig(_Strict):
@@ -96,8 +110,12 @@ class RetryConfig(_Strict):
 
 class PlanLimitConfig(_Strict):
     policy: Literal["wait", "fail"] = "wait"
+    max_waits_per_run: int | None = Field(None, ge=0, le=50)  # automatic waits per run (None: no limit)
     max_wait_hours: float = Field(6, ge=0)
     default_wait_minutes: float = Field(30, ge=0)
+    # Share of a model-specific plan window (Fable's weekly one) a run is expected to use. Before a run's first agent
+    # on such a model starts, the last known use plus this must not exceed the window. 0: no check. Trusted only.
+    model_window_reserve: float = Field(0, ge=0, le=1)
 
 
 class FullTextConfig(_Strict):
@@ -141,9 +159,25 @@ class EvidenceConfig(_Strict):
 class VerifierConfig(RoleConfig):
     """Blind verifiers: one per cited prior paper, checking overlap without seeing the refuter's argument."""
     enabled: bool = True
+    routing: Literal["fixed", "cross_model"] = "fixed"  # cross_model: the other model than the objection's author
+    counterpart: dict[str, str] = Field(default_factory=dict)  # author's model alias -> verifier's model alias
     max_agents_per_batch: int = Field(4, ge=0, le=20)
+    # Budgets per kind of batch, so one stage cannot use up another's: the refuters' batches share the per-run
+    # caps; each follow-up round and each gate or user batch has its own.
     max_agents_per_run: int = Field(8, ge=0, le=50)
+    max_papers_per_run: int = Field(8, ge=0, le=50)  # distinct prior papers verified for the refuters' objections
+    max_agents_per_followup_round: int = Field(2, ge=0, le=20)
+    max_papers_per_followup_round: int = Field(2, ge=0, le=20)
+    max_agents_per_user_batch: int = Field(2, ge=0, le=20)  # gate and user batches (run_verification)
+    max_papers_per_user_batch: int = Field(2, ge=0, le=20)
+    auto_gate_batch: bool = False  # after the judges, one gate batch for escalated objections never requested
     blocking: bool = False  # false: judges proceed; missing verifications become gate labels
+
+    def model_for(self, author_alias: str | None) -> str:
+        """The verifier's model for an objection written on `author_alias` (cross_model routing)."""
+        if self.routing == "cross_model" and author_alias in self.counterpart:
+            return self.counterpart[author_alias]
+        return self.model
 
 
 class FollowupConfig(_Strict):
@@ -215,7 +249,13 @@ class BudgetConfig(_Strict):
     section_priority: dict[str, list[str]] = Field(default_factory=dict)
 
 
+class PresetsConfig(_Strict):
+    selectable: list[str] = Field(default_factory=list)  # presets a run may pick (trusted settings only)
+
+
 class PipelineConfig(_Strict):
+    preset: str | None = None  # the preset the run was created from (absent in runs created before presets)
+    presets: PresetsConfig = Field(default_factory=PresetsConfig)
     orchestrator: OrchestratorConfig
     novelty: RoleConfig
     rigor: RoleConfig
@@ -299,12 +339,57 @@ FORBIDDEN_EXTRA_ARGS = (
 )
 
 
-def load_raw_config(override: Any = None) -> dict:
-    raw = yaml.safe_load((config_dir() / "default.yaml").read_text(encoding="utf-8")) or {}
+def preset_names() -> list[str]:
+    return sorted(p.stem for p in (config_dir() / "presets").glob("*.yaml"))
+
+
+def load_preset(name: str, _depth: int = 0) -> dict:
+    """A preset's settings (config/presets/<name>.yaml), with the preset it `extends` merged underneath."""
+    import re
+
+    if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9][a-z0-9_]*", name):
+        raise ConfigError(f"preset names are file stems like 'routine', not {name!r}")
+    path = config_dir() / "presets" / f"{name}.yaml"
+    if not path.is_file():
+        raise ConfigError(f"unknown preset '{name}' (available: {', '.join(preset_names()) or 'none'})")
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    parent = data.pop("extends", None)
+    data.pop("description", None)
+    if parent:
+        if _depth >= 3:
+            raise ConfigError(f"preset '{name}' extends too deeply")
+        data = deep_merge(load_preset(parent, _depth + 1), data)
+    return data
+
+
+def preset_description(name: str) -> str:
+    path = config_dir() / "presets" / f"{name}.yaml"
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    return str((data or {}).get("description") or "")
+
+
+def load_raw_config(override: Any = None, trusted: Any = None, preset: str | None = None) -> dict:
+    """The run's configuration: config/default.yaml, then the preset, then the trusted settings
+    ($PAPER_ADVERSARY_CONFIG, then `trusted`, e.g. the CLI's --trusted-config), then the per-run override.
+
+    A per-run override (and `preset`) is chosen by a model reading untrusted paper text, so it may pick a
+    selectable preset and lower or redirect settings, but it may not raise agent counts or limits, enable max
+    effort, or touch protected keys; those need trusted settings."""
+    base = yaml.safe_load((config_dir() / "default.yaml").read_text(encoding="utf-8")) or {}
     user_file = os.environ.get("PAPER_ADVERSARY_CONFIG")
-    if user_file:
-        raw = deep_merge(raw, parse_override(Path(user_file)))
-    per_run = parse_override(override)
+    trusted_all = deep_merge(parse_override(Path(user_file)) if user_file else {}, parse_override(trusted))
+    per_run = copy.deepcopy(parse_override(override))
+    trusted_view = deep_merge(base, trusted_all)
+    in_override = per_run.pop("preset", None)
+    picked = preset or in_override
+    name = picked or trusted_view.get("preset") or "routine"
+    chosen = load_preset(name)  # unknown or malformed names fail here, before anything else
+    selectable = list(((trusted_view.get("presets") or {}).get("selectable")) or [])
+    if picked and picked != trusted_view.get("preset") and picked not in selectable:
+        raise ConfigError(f"preset '{picked}' cannot be chosen per run (selectable: {', '.join(selectable) or 'none'}); "
+                          "add it to presets.selectable in config/default.yaml or $PAPER_ADVERSARY_CONFIG")
+    raw = deep_merge(deep_merge(base, chosen), trusted_all)
+    raw["preset"] = name
     locked = [f"provider.{k}" for k in PROTECTED_PROVIDER_KEYS if k in (per_run.get("provider") or {})]
     locked += _locked_gate_keys(per_run.get("gates"))
     fulltext = ((per_run.get("search") or {}).get("fulltext") or {})
@@ -314,10 +399,58 @@ def load_raw_config(override: Any = None) -> dict:
         locked.append("evidence")
     if (per_run.get("verifier") or {}).get("enabled") is False and (raw.get("verifier") or {}).get("enabled", True):
         locked.append("verifier.enabled (turning off the independent check)")
+    if (per_run.get("verifier") or {}).get("auto_gate_batch") and not (raw.get("verifier") or {}).get("auto_gate_batch"):
+        locked.append("verifier.auto_gate_batch (turning it on)")
+    if "model_window_reserve" in (per_run.get("plan_limit") or {}):  # lowering it would spend past the guard
+        locked.append("plan_limit.model_window_reserve")
+    if "presets" in per_run:
+        locked.append("presets")
+    locked += _raised_limits(raw, per_run)
+    locked += [f"{where} (max effort)" for where in _max_efforts(per_run)]
     if locked:
-        raise ConfigError(f"{', '.join(locked)} cannot be set per run; set it in config/default.yaml or the file "
-                          "named by $PAPER_ADVERSARY_CONFIG")
+        raise ConfigError(f"{', '.join(locked)} cannot be set per run; set it in config/default.yaml, the file "
+                          "named by $PAPER_ADVERSARY_CONFIG, or `--trusted-config` on the command line")
     return deep_merge(raw, per_run)
+
+
+# Usage-bearing limits a per-run override may lower but never raise (raising them needs trusted settings).
+RAISABLE_LIMITS = {
+    **{(role, "agents"): 1 for role in REVIEW_ROLES},
+    ("verifier", "max_agents_per_batch"): 0, ("verifier", "max_agents_per_run"): 0,
+    ("verifier", "max_papers_per_run"): 0,
+    ("verifier", "max_agents_per_followup_round"): 0, ("verifier", "max_papers_per_followup_round"): 0,
+    ("verifier", "max_agents_per_user_batch"): 0, ("verifier", "max_papers_per_user_batch"): 0,
+    ("plan_limit", "max_waits_per_run"): 0, ("plan_limit", "max_wait_hours"): 0,
+}
+
+
+def _raised_limits(raw: dict, per_run: dict) -> list[str]:
+    out = []
+    for (section, key) in RAISABLE_LIMITS:
+        new = (per_run.get(section) or {}).get(key) if isinstance(per_run.get(section), dict) else None
+        if new is None:
+            continue
+        old = (raw.get(section) or {}).get(key)
+        try:
+            raised = old is None or float(new) > float(old)
+        except (TypeError, ValueError):
+            raised = True
+        if raised:
+            out.append(f"{section}.{key} (above the configured {old if old is not None else 'unlimited'})")
+    return out
+
+
+def _max_efforts(node: Any, where: str = "") -> list[str]:
+    """Where a per-run override sets effort: max (anywhere: a role, an agent, a follow-up role, the repair)."""
+    out = []
+    if isinstance(node, dict):
+        for key, val in node.items():
+            here = f"{where}.{key}" if where else str(key)
+            if key == "effort" and isinstance(val, str) and val.strip().lower() == "max":
+                out.append(here)
+            else:
+                out += _max_efforts(val, here)
+    return out
 
 
 def _raised_followup_keys(base: dict, per_run: dict) -> list[str]:
@@ -370,8 +503,8 @@ def validate_config(raw: dict) -> PipelineConfig:
         raise ConfigError("invalid pipeline config:\n" + "\n".join(lines)) from exc
 
 
-def load_config(override: Any = None) -> tuple[PipelineConfig, dict]:
-    raw = load_raw_config(override)
+def load_config(override: Any = None, trusted: Any = None, preset: str | None = None) -> tuple[PipelineConfig, dict]:
+    raw = load_raw_config(override, trusted, preset)
     return validate_config(raw), raw
 
 
@@ -410,8 +543,40 @@ def check_model_and_effort(
     return info, issues
 
 
+def _check_per_agent(where: str, rc: RoleConfig, n_agents: int, lens_set: str | None,
+                     registry: ModelRegistry) -> list[ConfigIssue]:
+    """Per-agent overrides: agent numbers in range, known models, supported efforts, existing distinct lenses."""
+    from paper_adversary.prompts import PromptError, lens_by_id
+
+    issues = []
+    role = where.split(".")[-1]
+    lenses: list[str] = []
+    for index, ov in sorted(rc.per_agent.items()):
+        if not 1 <= index <= n_agents:
+            issues.append(ConfigIssue("error", f"{where}.per_agent.{index}", f"there is no agent {index} "
+                                      f"({n_agents} configured)"))
+            continue
+        alias, effort, lens = rc.for_agent(index)
+        issues += check_model_and_effort(f"{where}.per_agent.{index}", alias, effort, registry)[1]
+        if lens is None:
+            continue
+        if lens_set is None:
+            issues.append(ConfigIssue("error", f"{where}.per_agent.{index}", "this role takes no lens"))
+            continue
+        try:
+            lens_by_id(role, lens, lens_set)
+        except PromptError as exc:
+            issues.append(ConfigIssue("error", f"{where}.per_agent.{index}", str(exc)))
+        lenses.append(lens)
+    twice = sorted({x for x in lenses if lenses.count(x) > 1})
+    if twice:
+        issues.append(ConfigIssue("error", f"{where}.per_agent", f"lens(es) {', '.join(twice)} assigned to more "
+                                  "than one agent; give each agent its own focus"))
+    return issues
+
+
 def check_config(cfg: PipelineConfig, registry: ModelRegistry) -> list[ConfigIssue]:
-    from paper_adversary.prompts import prompt_exists, rubric_exists
+    from paper_adversary.prompts import PromptError, load_rubric, prompt_exists
 
     issues: list[ConfigIssue] = []
     if cfg.orchestrator.enabled:
@@ -423,6 +588,7 @@ def check_config(cfg: PipelineConfig, registry: ModelRegistry) -> list[ConfigIss
         rc = cfg.role(role)
         _, found = check_model_and_effort(role, rc.model, rc.effort, registry)
         issues += found
+        issues += _check_per_agent(role, rc, rc.agents, cfg.lens_set, registry)
         if not prompt_exists(rc.prompt):
             issues.append(ConfigIssue("error", role, f"prompt '{rc.prompt}' not found in prompts/"))
         if set(rc.tools) & SEARCH_TOOLS and role not in REFUTER_ROLES:
@@ -434,6 +600,8 @@ def check_config(cfg: PipelineConfig, registry: ModelRegistry) -> list[ConfigIss
             rc = cfg.role(role)
             _, found = check_model_and_effort(f"followup.{role}", rc.model, rc.effort, registry)
             issues += found
+            n = cfg.followup.adjudicators if role == "adjudicator" else 1
+            issues += _check_per_agent(f"followup.{role}", rc, n, None, registry)
             if not prompt_exists(rc.prompt):
                 issues.append(ConfigIssue("error", f"followup.{role}", f"prompt '{rc.prompt}' not found in prompts/"))
             if rc.tools:
@@ -448,6 +616,15 @@ def check_config(cfg: PipelineConfig, registry: ModelRegistry) -> list[ConfigIss
         vc = cfg.verifier
         _, found = check_model_and_effort("verifier", vc.model, vc.effort, registry)
         issues += found
+        for author, model in vc.counterpart.items():
+            for alias in (author, model):
+                if alias not in registry.models:
+                    issues.append(ConfigIssue("error", "verifier.counterpart", f"unknown model alias '{alias}'"))
+            if model in registry.models:
+                issues += check_model_and_effort("verifier.counterpart", model, vc.effort, registry)[1]
+        if vc.routing == "cross_model" and not vc.counterpart:
+            issues.append(ConfigIssue("warning", "verifier", "cross_model routing without a counterpart table: "
+                                      "every verifier uses verifier.model"))
         if not prompt_exists(vc.prompt):
             issues.append(ConfigIssue("error", "verifier", f"prompt '{vc.prompt}' not found in prompts/"))
         if set(vc.tools) - {"prior_text"}:
@@ -469,8 +646,13 @@ def check_config(cfg: PipelineConfig, registry: ModelRegistry) -> list[ConfigIss
     unknown = sorted(set(cfg.gates.structured.repair_first) - {"intake", *REFUTER_ROLES, "judge"})
     if unknown:
         issues.append(ConfigIssue("error", "gates.structured.repair_first", f"unknown roles {unknown}"))
-    if not rubric_exists(cfg.rubric):
-        issues.append(ConfigIssue("warning", "rubric", f"rubric '{cfg.rubric}' not found; judges will get none"))
+    try:
+        rubric_text = load_rubric(cfg.rubric)[1]
+    except PromptError as exc:  # not found (judges get none), or a malformed test declaration
+        issues.append(ConfigIssue("error", "rubric", f"rubric '{cfg.rubric}': {exc}") if "not found" not in str(exc) else
+                      ConfigIssue("warning", "rubric", f"rubric '{cfg.rubric}' not found; judges will get none"))
+    else:
+        issues += rubric_test_issues(rubric_text, cfg.judge.prompt, "rubric")
     if cfg.provider.allow_api_key:
         issues.append(ConfigIssue("warning", "provider", "allow_api_key is on: agents may bill ANTHROPIC_API_KEY"))
     bad = sorted({a.split("=", 1)[0] for a in cfg.provider.extra_args if a.split("=", 1)[0] in FORBIDDEN_EXTRA_ARGS})
@@ -478,6 +660,16 @@ def check_config(cfg: PipelineConfig, registry: ModelRegistry) -> list[ConfigIss
         issues.append(ConfigIssue("error", "provider.extra_args", f"{', '.join(bad)} would weaken agent isolation "
                                   "or override what the pipeline controls"))
     return issues
+
+
+def rubric_test_issues(text: str, judge_prompt: str, where: str) -> list[ConfigIssue]:
+    """A rubric that declares tests (front matter) needs a judge prompt that rules on them (judge_v3)."""
+    from paper_adversary.prompts import load_prompt, prompt_exists, rubric_tests
+
+    if rubric_tests(text) and prompt_exists(judge_prompt) and not load_prompt(judge_prompt).meta.get("rubric_tests"):
+        return [ConfigIssue("warning", where, f"the rubric declares tests, but judge prompt '{judge_prompt}' does not "
+                            "rule on them, so nothing checks them (use judge_v3)")]
+    return []
 
 
 def _structured_critic(prompt_name: str) -> bool:
@@ -527,7 +719,9 @@ class AgentSpec:
 
 
 def plan_agents(cfg: PipelineConfig, registry: ModelRegistry) -> list[AgentSpec]:
-    from paper_adversary.prompts import assign_lens
+    """The base agents of a new run: each role's agents with their own model, effort and lens (per_agent
+    overrides over the role's defaults). The result is saved in the run's state and never re-derived."""
+    from paper_adversary.prompts import assign_lens, lens_by_id
 
     specs: list[AgentSpec] = []
     if cfg.orchestrator.enabled:
@@ -539,13 +733,14 @@ def plan_agents(cfg: PipelineConfig, registry: ModelRegistry) -> list[AgentSpec]
         ))
     for role in REVIEW_ROLES:
         rc = cfg.role(role)
-        info = registry.resolve(rc.model)
         for i in range(1, rc.agents + 1):
+            alias, effort, lens_id = rc.for_agent(i)
+            lens = (lens_by_id(role, lens_id, cfg.lens_set) if lens_id
+                    else assign_lens(role, i, rc.agents, cfg.lens_set) if rc.lenses else None)
             specs.append(AgentSpec(
-                agent_id=f"{ROLE_PREFIX[role]}{i}", role=role, index=i, model_alias=rc.model, model_id=info.id,
-                effort=rc.effort, prompt_name=rc.prompt, tools=list(rc.tools), paper_format=rc.paper_format,
-                timeout_s=rc.timeout_minutes * 60, max_turns=rc.max_turns,
-                lens=assign_lens(role, i, rc.agents, cfg.lens_set) if rc.lenses else None,
+                agent_id=f"{ROLE_PREFIX[role]}{i}", role=role, index=i, model_alias=alias,
+                model_id=registry.resolve(alias).id, effort=effort, prompt_name=rc.prompt, tools=list(rc.tools),
+                paper_format=rc.paper_format, timeout_s=rc.timeout_minutes * 60, max_turns=rc.max_turns, lens=lens,
             ))
     return specs
 

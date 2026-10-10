@@ -4,8 +4,8 @@ A reference (arXiv ID, DOI, or title) is resolved through the scholarly APIs, th
 arXiv HTML rendering (LaTeXML: clean text, math as LaTeX, paragraph anchors), the arXiv PDF, and open-access PDFs
 that OpenAlex or Semantic Scholar list on an allowed host. Download URLs only ever come from that metadata, never
 from an agent. Documents are size-capped, type-checked and extracted in a resource-limited child process
-(search/extract.py). Results are cached machine-wide (content-addressed) and snapshotted into the run's prior/
-folder, so every reader in a run sees the same bytes. A paper with no retrievable open text is reported as
+(search/extract.py). Results are cached per runs directory (content-addressed, in its .cache/) and snapshotted
+into the run's prior/ folder, so every reader in a run sees the same bytes. A paper with no retrievable open text is reported as
 `fulltext_unavailable` with the reason; the abstract is never passed off as the full text.
 """
 
@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 import tempfile
 import time
@@ -243,7 +244,7 @@ class FullTextStore:
                             submission_text: str | None = None) -> FullTextResult:
         """A PDF or HTML file the user supplies (e.g. a paywalled paper), extracted like a download.
 
-        It goes into this run's snapshot only, never the machine-wide cache, and only if (a) its title matches
+        It goes into this run's snapshot only, never the shared cache, and only if (a) its title matches
         the paper it is filed under, (b) it is not the submission itself, and (c) no downloaded text is there."""
         from paper_adversary.search.extract import run_extraction
 
@@ -362,22 +363,20 @@ class FullTextStore:
         cached = self.oa_cache.get("oa", record.doi.lower())
         if cached is not None:
             return cached
-        from paper_adversary.search import Fetcher
-
         search = self._literature()
         urls: list[str] = []
-        gate = search.gates.get("openalex") or RateGate(self.cache_root / "ratelimit", "openalex", 0.15)
-        openalex = Fetcher(search._client, gate, search.breaker, "openalex")
+        openalex = search.fetcher("openalex", 0.15)  # with that provider's retry and breaker policy
         try:
-            work = await openalex.get_json(f"https://api.openalex.org/works/doi:{doi}",
-                                           params={"select": "id,doi,best_oa_location,locations,open_access"})
+            params = {"select": "id,doi,best_oa_location,locations,open_access"}
+            if os.environ.get("OPENALEX_API_KEY"):
+                params["api_key"] = os.environ["OPENALEX_API_KEY"]
+            work = await openalex.get_json(f"https://api.openalex.org/works/doi:{doi}", params=params)
         except ProviderUnavailable:
             work = None
         if work:
             locs = [work.get("best_oa_location") or {}] + list(work.get("locations") or [])
             urls += [loc.get("pdf_url") for loc in locs if isinstance(loc, dict) and loc.get("pdf_url")]
-        gate = search.gates.get("semantic_scholar") or RateGate(self.cache_root / "ratelimit", "semantic_scholar", 1.1)
-        s2 = Fetcher(search._client, gate, search.breaker, "semantic_scholar")
+        s2 = search.fetcher("semantic_scholar", 1.1)
         try:
             paper = await s2.get_json(f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}",
                                       params={"fields": "openAccessPdf,externalIds"})

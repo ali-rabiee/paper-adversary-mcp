@@ -68,6 +68,8 @@ def refuter_objections(data: dict | None, agent_id: str) -> list[dict]:
 
 
 def judge_judgments(data: dict | None) -> list[dict]:
+    """A judge's judgments with normalized IDs and severities. `member_severity` (judge_v3) keeps only entries for
+    the judgment's own IDs with a valid severity (gates.validate_block warns about the others)."""
     if not data:
         return []
     out = []
@@ -78,7 +80,63 @@ def judge_judgments(data: dict | None) -> list[dict]:
         if isinstance(ids, str):
             ids = [ids]
         ids = [re.sub(r"\s+", "", str(x)).upper() for x in ids if x]
-        out.append({**j, "objection_ids": ids, "severity": normalize_severity(j.get("severity"))})
+        raw = j.get("member_severity")
+        member = {}
+        for key, value in (raw.items() if isinstance(raw, dict) else []):
+            oid, sev = re.sub(r"\s+", "", str(key)).upper(), normalize_severity(value)
+            if oid in ids and sev:
+                member[oid] = sev
+        out.append({**j, "objection_ids": ids, "severity": normalize_severity(j.get("severity")),
+                    "member_severity": member})
+    return out
+
+
+def member_severity(judgment: dict, oid: str) -> str | None:
+    """One objection's own severity in a judgment: its member_severity entry, else the judgment's severity (which
+    judge_v3 defines as its strongest member's)."""
+    return (judgment.get("member_severity") or {}).get(oid) or judgment.get("severity")
+
+
+def is_grouped(judgment: dict, oid: str) -> bool:
+    """Whether this objection's severity in the judgment is only the group's: the judgment covers several
+    objections and gives this one no severity of its own. Under a judge prompt that defines member_severity
+    (judge_v3, front matter `member_severity: true`, marked `own_severities` by build_matrix), a member left out of
+    member_severity is rated at the judgment's severity by the judge's own contract, so no member is only grouped."""
+    return len(judgment.get("objection_ids") or []) > 1 and oid not in (judgment.get("member_severity") or {}) \
+        and not judgment.get("own_severities")
+
+
+RUBRIC_APPLIES = {"yes": "yes", "no": "no", "partly": "partly", "partially": "partly", "partial": "partly"}
+
+
+def rubric_ruling(entry: object) -> tuple[dict | None, str | None]:
+    """(normalized ruling, problem) for one entry of a judge's rubric_rulings (judge_v3). A test that applies (yes
+    or partly) needs a severity; one that does not apply has none."""
+    if not isinstance(entry, dict):
+        return None, "a ruling is not an object"
+    tid = re.sub(r"\s+", "", str(entry.get("test_id") or entry.get("id") or "")).upper()
+    if not tid:
+        return None, "a ruling has no test_id"
+    applies = RUBRIC_APPLIES.get(re.sub(r"[^a-z]+", "", str(entry.get("applies") or "").lower()))
+    rec = {"test_id": tid, "applies": applies, "severity": None,
+           "rationale": " ".join(str(entry.get("rationale") or "").split())}
+    if applies is None:
+        return rec, f"{tid}: applies {entry.get('applies')!r} is not yes, no or partly"
+    if applies != "no":
+        rec["severity"] = normalize_severity(entry.get("severity"))
+        if rec["severity"] is None:
+            return rec, f"{tid}: applies '{applies}' but severity {entry.get('severity')!r} is not one of the four"
+    return rec, None
+
+
+def rubric_rulings(data: dict | None) -> list[dict]:
+    """A judge's valid rubric rulings, normalized (invalid ones are what the gate's rubric check reports)."""
+    raw = (data or {}).get("rubric_rulings")
+    out = []
+    for entry in raw if isinstance(raw, list) else []:
+        rec, problem = rubric_ruling(entry)
+        if rec is not None and problem is None:
+            out.append(rec)
     return out
 
 
@@ -137,13 +195,18 @@ def references_from(data: dict | None) -> list[dict]:
 
 
 def build_judgment_matrix(objections: dict[str, list[dict]], judgments: dict[str, list[dict]],
-                          excluded: dict[str, str] | None = None) -> dict:
+                          excluded: dict[str, str] | None = None, rubric_tests: list[dict] | None = None,
+                          rubric: dict[str, list[dict]] | None = None) -> dict:
     """Cross-tabulate every refuter objection against every judge's verdict.
 
-    Verdicts are kept per judge, never averaged. Flags mark objections no judge
+    Verdicts are kept per judge, never averaged, each at the objection's own severity (member_severity of a
+    grouped judgment, else the judgment's); a verdict records its judgment (`group`, `group_ids`,
+    `group_severity`) and whether its severity is only the group's (`grouped`). Flags mark objections no judge
     classified, objections some judges skipped, and contested objections.
     `excluded` names refuters and judges left out (failed or quarantined) with a
     short label; judge citations of an excluded refuter's IDs are listed apart.
+    `rubric_tests` (the rubric's declared tests) and `rubric` (judge -> its normalized rubric rulings) add one
+    row per test with each judge's ruling.
     """
     excluded = excluded or {}
     known = {o["id"]: o for objs in objections.values() for o in objs}
@@ -156,7 +219,7 @@ def build_judgment_matrix(objections: dict[str, list[dict]], judgments: dict[str
     excluded_refs: dict[str, list[str]] = {}
     double: dict[str, list[str]] = {}
     for jid, items in judgments.items():
-        for item in items:
+        for k, item in enumerate(items, start=1):
             for oid in item["objection_ids"]:
                 if oid not in rows:
                     target = excluded_refs if oid.split("-")[0] in excluded else unknown_refs
@@ -165,9 +228,12 @@ def build_judgment_matrix(objections: dict[str, list[dict]], judgments: dict[str
                 if jid in rows[oid]["verdicts"]:  # keep the first verdict and say so; never overwrite silently
                     double.setdefault(jid, []).append(oid)
                     continue
-                rows[oid]["verdicts"][jid] = {"severity": item.get("severity"),
+                rows[oid]["verdicts"][jid] = {"severity": member_severity(item, oid),
                                               "confidence": item.get("confidence"),
-                                              "resolvable": item.get("resolvable_with_more_evidence")}
+                                              "resolvable": item.get("resolvable_with_more_evidence"),
+                                              "group": f"{jid}#{k}", "group_ids": list(item["objection_ids"]),
+                                              "group_severity": item.get("severity"),
+                                              "grouped": is_grouped(item, oid)}
     judges = sorted(judgments)
     for row in rows.values():
         ranks = [SEVERITY_RANK[v["severity"]] for v in row["verdicts"].values() if v.get("severity")]
@@ -176,7 +242,7 @@ def build_judgment_matrix(objections: dict[str, list[dict]], judgments: dict[str
         row["unanimous"] = len(ranks) == len(judges) and len(set(ranks)) == 1 and bool(judges)
         row["max_severity"] = next((s for s, r in SEVERITY_RANK.items() if ranks and r == max(ranks)), None)
     ordered = sorted(rows.values(), key=lambda r: (-(SEVERITY_RANK.get(r["max_severity"] or "", -1)), r["id"]))
-    return {
+    matrix = {
         "judges": judges,
         "rows": ordered,
         "never_classified": [r["id"] for r in ordered if judges and len(r["unclassified_by"]) == len(judges)],
@@ -189,6 +255,24 @@ def build_judgment_matrix(objections: dict[str, list[dict]], judgments: dict[str
         "judges_without_structured_output": [],
         "refuters_without_structured_data": [],
     }
+    if rubric_tests:
+        table = []
+        for t in rubric_tests:
+            rulings = {}
+            for jid in judges:
+                r = next((x for x in (rubric or {}).get(jid) or [] if x.get("test_id") == t["id"]), None)
+                if r:
+                    rulings[jid] = {"applies": r.get("applies"), "severity": r.get("severity"),
+                                    "rationale": str(r.get("rationale") or "")[:400]}
+            table.append({"id": t["id"], "text": t["text"], "rulings": rulings,
+                          "not_ruled_by": [j for j in judges if j not in rulings]})
+        matrix["rubric_tests"] = table
+    return matrix
+
+
+def _flagged(matrix: dict) -> set[str]:
+    """IDs the evidence gate of this matrix found not shown (base matrix: 'evidence_gate'; follow-up: 'gate')."""
+    return set((matrix.get("evidence_gate") or matrix.get("gate") or {}).get("flagged_ids") or [])
 
 
 def matrix_markdown(matrix: dict, title: str = "Judgment matrix", followup: bool = False) -> str:
@@ -203,23 +287,32 @@ def matrix_markdown(matrix: dict, title: str = "Judgment matrix", followup: bool
         "Computed by the orchestrator from the refuters' and judges' structured blocks. "
         "Each cell is one judge's own verdict; nothing is averaged.")
     lines = [f"# {title}", "", note, "", head, sep]
+    flagged = _flagged(matrix)
+    grouped = False
     for r in matrix["rows"]:
         cells = []
         for j in judges:
             v = r["verdicts"].get(j)
-            cells.append(f"{SEVERITY_LABEL.get(v['severity'], v['severity'] or '?')} ({v.get('confidence') or '?'})"
-                         if v else "—")
+            grouped = grouped or bool(v and v.get("grouped"))
+            cells.append(f"{SEVERITY_LABEL.get(v['severity'], v['severity'] or '?')} ({v.get('confidence') or '?'}"
+                         + (", grouped)" if v.get("grouped") else ")") if v else "—")
         flags = []
         if r["contested"]:
             flags.append("contested")
         if r["unclassified_by"] and judges:
             flags.append("not classified by " + ",".join(r["unclassified_by"]))
+        if r["id"] in flagged:
+            flags.append("not shown (evidence gate)")
         title = (r["title"] or "").replace("|", "/")[:90]
         ev = f" | {(r.get('evidence') or '—').replace('|', '/')}" if evidence else ""
         lines.append(f"| {r['id']} | {r['source']} | {title} | " + " | ".join(cells) + ev + f" | {'; '.join(flags)} |")
     never = "Items no adjudicator ruled on" if followup else "Objections no judge classified"
     lines += ["", f"{never}: {', '.join(matrix['never_classified']) or 'none'}",
               f"Contested (verdicts two or more levels apart): {', '.join(matrix['contested']) or 'none'}"]
+    if grouped:
+        lines.append("Cells marked 'grouped': the severity of a " + ("ruling" if followup else "judgment")
+                     + " that covers several IDs and gave this one no severity of its own; it is not necessarily that "
+                     + ("adjudicator's" if followup else "judge's") + " view of this ID alone.")
     if matrix["unknown_ids_cited_by_judges"]:
         lines.append("Judge citations of objection IDs that do not exist: "
                      + "; ".join(f"{j}: {', '.join(v)}" for j, v in matrix["unknown_ids_cited_by_judges"].items()))
@@ -242,4 +335,17 @@ def matrix_markdown(matrix: dict, title: str = "Judgment matrix", followup: bool
         lines.append("Judge citations of objections from excluded refuters: "
                      + "; ".join(f"{j}: {', '.join(v)}" for j, v in
                                  matrix["ids_of_excluded_refuters_cited_by_judges"].items()))
+    if matrix.get("rubric_tests"):
+        lines += ["", "## Rubric tests", "",
+                  "Each test the rubric declares, as each judge ruled on it whether or not a refuter raised it "
+                  "(applies; severity if it applies). A test that applies with FATAL severity counts like a FATAL "
+                  "judgment. An empty cell: the judge gave no ruling (judge prompts before judge_v3 give none).", "",
+                  "| Test | Text | " + " | ".join(judges) + " |", "|" + "---|" * (2 + len(judges))]
+        for t in matrix["rubric_tests"]:
+            cells = []
+            for j in judges:
+                r = t["rulings"].get(j)
+                cells.append("—" if not r else r["applies"] if not r.get("severity")
+                             else f"{r['applies']}, {SEVERITY_LABEL.get(r['severity'], r['severity'])}")
+            lines.append(f"| {t['id']} | {t['text'].replace('|', '/')[:160]} | " + " | ".join(cells) + " |")
     return "\n".join(lines) + "\n"

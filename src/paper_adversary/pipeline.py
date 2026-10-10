@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import datetime as dt
+import os
 import random
 import re
 import shutil
@@ -34,9 +35,19 @@ from paper_adversary.evidence import check_agent_evidence, quoted_passages
 from paper_adversary.evidence_gate import evaluate as evaluate_evidence
 from paper_adversary.evidence_gate import gate_markdown, member_status
 from paper_adversary.search.fulltext import FullTextStore
-from paper_adversary.verification import VerificationRequest, collect, pending_requests, plan_batch
+from paper_adversary.verification import (
+    VerificationRequest,
+    budget_pool,
+    collect,
+    gate_requests,
+    ledger_claim_map,
+    ledger_entries,
+    origin_hash,
+    pending_requests,
+    plan_batch,
+)
 from paper_adversary.config import REFUTER_ROLES, STAGE_ORDER, AgentSpec
-from paper_adversary.context import BuiltContext, ContextBuilder
+from paper_adversary.context import BuiltContext, ContextBuilder, run_rubric_tests
 from paper_adversary.isolation import (
     IsolationGuard,
     IsolationViolation,
@@ -45,8 +56,9 @@ from paper_adversary.isolation import (
     new_marker,
     position,
 )
-from paper_adversary.prompts import PromptTemplate, load_prompt
+from paper_adversary.prompts import PromptTemplate, load_prompt, prompt_exists
 from paper_adversary.providers import RUN_FATAL, AgentRequest, AgentResult, ErrorKind, ProviderError, make_provider
+from paper_adversary.providers.base import MODEL_WINDOWS
 from paper_adversary.registry import ModelRegistry
 from paper_adversary.reports import (
     SEVERITY_LABEL,
@@ -56,12 +68,15 @@ from paper_adversary.reports import (
     read_report,
     references_from,
     refuter_objections,
+    rubric_rulings,
     strip_marker,
     write_report,
 )
 from paper_adversary.store import RunStore
+from paper_adversary.search import DEGRADED_SHARE, provider_health
 from paper_adversary.usage import summarize
 from paper_adversary.util import (
+    FileLock,
     append_jsonl,
     atomic_write_json,
     atomic_write_text,
@@ -145,6 +160,10 @@ class Pipeline:
         self._last_launch = 0.0
         self._exclude_shingles: set[str] | None = None
         self._auto_reruns = 0  # automatic reruns after failed isolation checks, this job
+        # Models stopped at a model-specific plan limit in this job (model ID -> {message, reset_at, type}): their
+        # agents are interrupted, agents on other models keep running (_plan_stop).
+        self.blocked_models: dict[str, dict] = {}
+        self._ran: set[str] = set()  # agents this job started (a verifier that failed in it is not run again in it)
 
     # ------------------------------------------------------------ state helpers
 
@@ -196,6 +215,16 @@ class Pipeline:
                     st["followup"].update(stale=f"{aid} was rerun", current_memo="S1")
                 self.store.update_state(mutate)
 
+    def _refresh_stale(self, roles: list[str]) -> list[str]:
+        """Mark these roles' base agents whose inputs changed for a rerun (their old outputs are archived)."""
+        state = self.store.load_state()
+        stale = {aid: why for aid, why in stale_agents(self.store, state).items()
+                 if state["agents"][aid]["role"] in roles and not int(state["agents"][aid].get("round") or 0)}
+        if stale:
+            self.store.event("stale_rerun", agents=sorted(stale), reasons=stale)
+            self._mark_rerun(sorted(stale))
+        return sorted(stale)
+
     def specs_for(self, stages: list[str], state: dict | None = None) -> list[AgentSpec]:
         """Base-review agents of these stages (follow-up rounds run their own agents, see run_followup)."""
         state = state or self.store.load_state()
@@ -204,7 +233,11 @@ class Pipeline:
 
     # ------------------------------------------------------------ run
 
-    async def run(self, stages: list[str], rerun: list[str] | None = None, allow_incomplete: bool = False) -> dict:
+    async def run(self, stages: list[str], rerun: list[str] | None = None, allow_incomplete: bool = False,
+                  refresh_stale: bool = False) -> dict:
+        """Run these stages. With refresh_stale (a resume), each stage first reruns its complete agents whose
+        inputs changed since they ran, so a changed upstream output carries through every dependent stage;
+        unchanged outputs are reused."""
         extra_batches = [s.split(":", 1)[1] for s in stages if s.startswith("verify:")]
         followup = "followup" in stages
         if "judge" in stages and self._verification_pending():
@@ -225,6 +258,8 @@ class Pipeline:
                 problems = check_preconditions(self.store.load_state(), wanted[0], allow_incomplete)
                 if problems:
                     raise PreconditionError(f"cannot start {', '.join(wanted)}: " + "; ".join(problems))
+                if refresh_stale and wanted != ["verifier"] and self._refresh_stale(wanted):
+                    await self.preflight(wanted)  # the reruns' model setups were not runnable at the start
                 if wanted == ["verifier"]:
                     await self.ensure_refchecks()
                     await self.ensure_evidence()
@@ -232,16 +267,25 @@ class Pipeline:
                         await self.preflight(["verifier"])
                 if wanted == ["judge"]:
                     await self.ensure_refchecks()
+                if wanted == ["synthesis"] and not await self._auto_gate_step():  # finishes one cut short
+                    outcome, message = "cancelled", "cancelled by request"
+                    break
                 if wanted == ["synthesis"] or wanted == ["critic"]:
                     self.build_matrix()
+                if wanted in (["judge"], ["synthesis"], ["critic"]):
+                    self.note_search_health()  # also after a resume, before anything reads it
                 await self._run_group(wanted)
                 if self.fatal:
                     raise self.fatal
                 if self.cancel.is_set():
                     outcome, message = "cancelled", "cancelled by request"
                     break
+                if "novelty" in wanted:
+                    self.note_search_health()
                 if wanted == ["verifier"]:
-                    finished = self.finish_refuter_batches()
+                    # a verifier stopped at its model's plan limit: the batch stays planned for the resume
+                    self._raise_if_blocked([s.agent_id for s in self.specs_for(["verifier"])])
+                    finished = self.finish_open_batches()
                     vc = self.cfg.verifier
                     if vc is not None and vc.blocking and "incomplete" in finished.values():
                         outcome = "incomplete"
@@ -262,6 +306,9 @@ class Pipeline:
                         message = (f"stopped before {later[0]}: "
                                    + ", ".join(gates.unavailable_label(a, state["agents"][a]) for a in failed))
                         break
+                if wanted == ["judge"] and not failed and not await self._auto_gate_step():
+                    outcome, message = "cancelled", "cancelled by request"
+                    break
             for batch_id in extra_batches:
                 if outcome != "complete" or self.cancel.is_set():
                     break
@@ -271,6 +318,7 @@ class Pipeline:
                     await self._run_group(["verifier"])
                     if self.fatal:
                         raise self.fatal
+                    self._raise_if_blocked([s.agent_id for s in self.specs_for(["verifier"])])
                 self.finish_verification(batch_id)
                 self.build_matrix()
             if followup and outcome == "complete" and not self.cancel.is_set():
@@ -282,7 +330,7 @@ class Pipeline:
                 elif result.get("outcome"):
                     message = f"follow-up: {result['outcome']}"
         except ProviderError as exc:
-            outcome, message = "failed", str(exc)
+            outcome, message = ("incomplete" if exc.kind is ErrorKind.PLAN_LIMIT else "failed"), str(exc)
         except (PreconditionError, BudgetError, IsolationViolation) as exc:
             outcome, message = "blocked", str(exc)
         finally:
@@ -296,6 +344,9 @@ class Pipeline:
                 outcome = "quarantined" if quarantined else "incomplete"
                 message = "not complete: " + ", ".join(gates.unavailable_label(a, state["agents"][a])
                                                        for a in unfinished)
+        if self.blocked_models and outcome in ("complete", "incomplete", "quarantined"):  # resumable after the reset
+            plan = self._plan_limit_error().message
+            outcome, message = "incomplete", message if plan in message else "; ".join(x for x in (plan, message) if x)
         self.store.update_state(lambda st: st.__setitem__("last_job", {
             "stages": stages, "outcome": outcome, "message": message, "finished_at": utcnow_iso()}))
         self.store.event("job_finished", outcome=outcome, message=message)
@@ -347,7 +398,11 @@ class Pipeline:
         state = self.store.load_state()
         pending = [s for s in (specs if specs is not None else self.specs_for(stages, state))
                    if state["agents"][s.agent_id]["status"] in RUNNABLE]
-        if not pending or (mode == "off" and self.provider.name == "mock"):
+        if not pending:
+            return
+        self._window_guard(pending)  # with what is known before any call (also without probes)
+        self._search_warning(pending)
+        if mode == "off" and self.provider.name == "mock":
             return
         auth = await self.provider.auth_status()
         self.store.update_state(lambda st: st.setdefault("preflight", {}).__setitem__("auth", auth))
@@ -376,6 +431,7 @@ class Pipeline:
                 probe = {**hit, "cached": True}
             else:
                 probe = await self._probe(model, tools)
+                self._note_plan_usage((probe.get("runtime") or {}).get("rate_limit") or probe.get("rate_limit"), model)
                 if probe.get("ok"):
                     cache[key] = probe
                     atomic_write_json(cache_path, cache)
@@ -388,9 +444,21 @@ class Pipeline:
                 probes[key] = probe
             if not probe.get("ok"):
                 self._probe_failed(model, tools, probe, members)
-        self.store.update_state(lambda st: st.setdefault("preflight", {}).update({"models": models, "probes": probes}))
+        failed = {model for model, _ in groups} - set(models)
+
+        def merge(st: dict) -> None:  # later preflights (verifiers, follow-up) cover fewer models: merge, never replace
+            pf = st.setdefault("preflight", {})
+            pf.setdefault("probes", {}).update(probes)
+            known = pf.setdefault("models", {})
+            for m, probe in models.items():
+                if probe.get("context_window") or not (known.get(m) or {}).get("context_window"):
+                    known[m] = probe
+            for m in failed:  # its latest probe failed: no stale ok entry stays behind
+                known.pop(m, None)
+        self.store.update_state(merge)
         self.store.event("preflight", auth={k: auth.get(k) for k in ("ok", "authMethod", "subscriptionType")},
                          probes={k: {"ok": r.get("ok"), "error": r.get("error")} for k, r in probes.items()})
+        self._window_guard(pending)  # again, with the plan windows this preflight's own probes just reported
 
     def _probe_tools(self, spec: AgentSpec) -> list[str]:
         """The tool setup a real agent of this spec gets, so the probe exercises the same init."""
@@ -426,9 +494,74 @@ class Pipeline:
         # agents on this model wait (plan_limit policy) or retry on their own.
         self.store.event("preflight_warning", setup=setup, error=probe.get("error"), kind=kind)
 
+    def _search_warning(self, pending: list[AgentSpec]) -> None:
+        """A search provider without its key has little to give. Semantic Scholar without a key shares a public pool:
+        in the K1 pilot it answered HTTP 429 to 37 of 43 literature calls. OpenAlex without a key has a tiny daily
+        budget (since February 2026; the K2 run on 2026-10-02 spent it after about two runs). Warn (event and status)
+        before literature agents start, once per run and provider. Once a key is set (or the provider dropped), any
+        preflight removes that warning, so the status no longer says it is missing."""
+        missing = []
+        if "semantic_scholar" in self.cfg.search.providers and not os.environ.get("S2_API_KEY"):
+            missing.append(
+                "semantic_scholar is a search provider but S2_API_KEY is not set: keyless requests share Semantic "
+                "Scholar's public pool, which answered HTTP 429 to most calls in the K1 pilot. Put S2_API_KEY in the "
+                "server's .env, or accept reduced coverage (the status reports it as search health)")
+        if "openalex" in self.cfg.search.providers and not os.environ.get("OPENALEX_API_KEY"):
+            missing.append(
+                "openalex is a search provider but OPENALEX_API_KEY is not set: without a key OpenAlex's daily budget "
+                "covers about 100 searches (about two reviews; it ran out in the K2 run on 2026-10-02), and a free "
+                "key raises it to about 1,000. Put OPENALEX_API_KEY in the server's .env, or accept reduced coverage")
+        stale = [w for w in (self.store.load_state().get("preflight") or {}).get("warnings") or []
+                 if w.get("kind") == "search" and w.get("message") not in missing]
+        if stale:
+            self.store.update_state(lambda st: st["preflight"].__setitem__("warnings", [
+                w for w in st["preflight"].get("warnings") or []
+                if w.get("kind") != "search" or w.get("message") in missing]))
+        if not missing or not any("literature" in s.tools for s in pending):
+            return
+        state = self.store.load_state()
+        known = {w.get("message") for w in (state.get("preflight") or {}).get("warnings") or []}
+        for text in missing:
+            if text in known:
+                continue
+            self.store.update_state(lambda st, text=text: st.setdefault("preflight", {}).setdefault(
+                "warnings", []).append({"kind": "search", "message": text, "at": utcnow_iso()}))
+            self.store.event("preflight_warning", setup="search", kind="search_config", error=text)
+
+    def _window_guard(self, pending: list[AgentSpec]) -> None:
+        """plan_limit.model_window_reserve: before a run's first agent on a model with a model-specific window
+        (Fable's weekly one) starts, stop the job when that window's last known use plus the reserve would exceed it,
+        so nothing is spent on a run that cannot finish there. The job ends incomplete and resumable; agents stay
+        pending. The reserve is the trusted estimate of one run's share. Once a run has started agents on the model,
+        the guard no longer applies to it: a full window then stops only that model's agents (_plan_stop)."""
+        reserve = self.cfg.plan_limit.model_window_reserve
+        if not reserve:
+            return
+        state = self.store.load_state()
+        started = {a.get("model") for a in state["agents"].values()
+                   if int(a.get("attempts") or 0) > 0 or a["status"] == "complete"}
+        known = known_model_windows(state)
+        now = time.time()
+        for model in sorted({s.model_id for s in pending}):
+            for name, w in sorted((known.get(model) or {}).items()):
+                used, resets = w.get("utilization"), w.get("resetsAt")
+                if not isinstance(used, (int, float)) or (isinstance(resets, (int, float)) and resets <= now):
+                    continue  # no figure, or the window has reset since
+                if model in started or used + reserve <= 1.0:
+                    continue
+                label, reset_at = _model_name(self.registry, model), _stamp_iso(resets)
+                message = (f"{label}'s model-specific {MODEL_WINDOWS.get(name, '')} window ({name}) was {used:.0%} "
+                           f"used as of {w.get('observed_at')}, and this run's {label} agents are estimated at "
+                           f"{reserve:.0%} of it (plan_limit.model_window_reserve). Stopped before any {label} agent "
+                           f"started; resume_run continues after the reset ({reset_at or 'time not reported'})")
+                self.store.event("plan_limit_guard", model=model, window=name, utilization=used, reserve=reserve,
+                                 reset_at=reset_at, message=message)
+                raise ProviderError(ErrorKind.PLAN_LIMIT, message, reset_at=reset_at)
+
     # ------------------------------------------------------------ one agent
 
     async def _agent_task(self, spec: AgentSpec, gate_only: bool = False) -> None:
+        self._ran.add(spec.agent_id)
         try:
             if self.cancel.is_set() or self.fatal:
                 return
@@ -489,6 +622,10 @@ class Pipeline:
                     await self._stagger()
                     if self.cancel.is_set() or self.fatal:
                         return None
+                    if spec.model_id in self.blocked_models:  # stopped at its model's plan limit in this job
+                        self._set(aid, status="interrupted",
+                                  detail=f"plan limit: {self.blocked_models[spec.model_id]['message']}")
+                        return None
                     self._set(aid, status="running", attempts=attempt, started_at=utcnow_iso(),
                               detail=f"attempt {attempt}", est_input_tokens=ctx.est_input_tokens,
                               doc_mode=ctx.doc_plan.get("mode"))
@@ -517,14 +654,11 @@ class Pipeline:
                     return None
                 if err.kind is ErrorKind.PLAN_LIMIT:
                     plan_wait_started = plan_wait_started or time.monotonic()
-                    waited = await self._wait_plan_limit(aid, err.message, err.reset_at, plan_wait_started)
-                    if waited is None and self.cancel.is_set():
-                        self._set(aid, status="interrupted", detail="cancelled while waiting for the plan limit")
-                        return None
-                    if waited is None:
+                    if await self._wait_plan_limit(aid, err, spec.model_id, plan_wait_started) is not None:
+                        continue
+                    if self.cfg.plan_limit.policy == "fail":
                         self._set(aid, status="failed", detail=f"plan limit: {err.message}", finished_at=utcnow_iso())
-                        return None
-                    continue
+                    return None  # otherwise interrupted, with the reason (_wait_plan_limit)
                 if err.kind is ErrorKind.CONTEXT_OVERFLOW and budget_scale == 1.0:
                     budget_scale = 0.5  # rebuild once with half the assumed window (sectioned mode)
                     continue
@@ -543,26 +677,126 @@ class Pipeline:
                     self._set(aid, status="interrupted", detail="cancelled while waiting to retry")
                     return None
 
-    async def _wait_plan_limit(self, aid: str | None, message: str, reset_at: str | None,
+    async def _wait_plan_limit(self, aid: str | None, err: ProviderError, model: str,
                                started: float | None = None) -> float | None:
-        """Sleep until the plan limit resets. Returns seconds waited, or None if the policy says stop."""
+        """Sleep until the plan limit resets. Returns seconds waited, or None when the job does not wait: the
+        policy is `fail`; the reset lies beyond max_wait_hours (checked before a wait slot is reserved, so a skipped
+        wait uses none); this run's waits are used up; or the job was cancelled meanwhile. Except under `fail`, the
+        agent is then interrupted with the reason, and _plan_stop decides what else stops."""
         pl = self.cfg.plan_limit
         if pl.policy == "fail":
             return None
+        limit = _limit_of(err, model)
+        if limit["scope"] == "model" and limit["model"] in self.blocked_models:
+            self._plan_stop(aid, err, model, "", "")  # already stopped in this job: this agent waits for it too
+            return None
         now = utcnow()
-        reset = parse_iso(reset_at) if reset_at else None
-        wait = (reset - now).total_seconds() + 30 if reset else pl.default_wait_minutes * 60
-        wait = max(1.0, wait)
+        reset = parse_iso(err.reset_at) if err.reset_at else None
+        wait = max(1.0, (reset - now).total_seconds() + 30 if reset else pl.default_wait_minutes * 60)
         spent = time.monotonic() - started if started else 0.0
         if spent + wait > pl.max_wait_hours * 3600:
+            self._plan_stop(aid, err, model, f", beyond plan_limit.max_wait_hours ({pl.max_wait_hours:g} h)",
+                            "plan_limit_skip")
             return None
         until = now + dt.timedelta(seconds=wait)
+        if not self._may_wait(err.reset_at, limit, until):
+            used = int((self.store.load_state().get("plan_limit") or {}).get("waits") or 0)
+            self._plan_stop(aid, err, model, f"; this run's {used} automatic wait(s) (plan_limit.max_waits_per_run) "
+                            "are used up", "plan_limit_stop")
+            return None
         if aid:
             self._set(aid, status="waiting_plan_limit", wait_until=until.isoformat(timespec="seconds"),
                       detail=f"plan usage limit reached; resuming at {until.astimezone().strftime('%H:%M')}")
-        self.store.event("plan_limit_wait", agent_id=aid, seconds=int(wait), message=message[:300])
+        self.store.event("plan_limit_wait", agent_id=aid, seconds=int(wait), message=err.message[:300], model=model,
+                         limit_type=limit["type"], scope=limit["scope"])
         await self._sleep(wait)
-        return None if self.cancel.is_set() else wait
+        if not self.cancel.is_set():
+            return wait
+        if aid:
+            stop = self.fatal is not None and self.fatal.kind is ErrorKind.PLAN_LIMIT
+            self._set(aid, status="interrupted", detail=f"plan limit: {self.fatal.message}" if stop
+                      else "cancelled while waiting for the plan limit")
+        return None
+
+    def _plan_stop(self, aid: str | None, err: ProviderError, model: str, why: str, event: str) -> None:
+        """Stop at a plan limit without waiting. A model-specific limit (Fable's weekly window) blocks only that
+        model: its agents are interrupted when they would start, agents on other models keep running, and later
+        stages proceed when their inputs are complete. An account-wide limit stops the job. Either way the agents
+        are interrupted, not failed, with the model, limit type and reset time, and resume_run reruns them."""
+        limit = _limit_of(err, model)
+        name = _model_name(self.registry, limit["model"])
+        what = (f"{name}'s model-specific plan limit" if limit["scope"] == "model"
+                else f"the plan's usage limit (hit by {name})")
+        message = (f"stopped at {what} ({limit['model']}; {limit['type'] or 'limit type not reported'}), which "
+                   f"resets {err.reset_at or 'at a time not reported'}{why}; resume_run continues after the reset")
+        if limit["scope"] == "model":
+            first = limit["model"] not in self.blocked_models
+            if first:
+                self.blocked_models[limit["model"]] = {"message": message, "reset_at": err.reset_at,
+                                                       "type": limit["type"]}
+            message = self.blocked_models[limit["model"]]["message"]
+        else:
+            first = self.fatal is None
+            self.fatal = self.fatal or ProviderError(ErrorKind.PLAN_LIMIT, message, reset_at=err.reset_at)
+            message = self.fatal.message
+            self.cancel.set()
+        if first and event:
+            self.store.event(event, agent_id=aid, model=limit["model"], limit_type=limit["type"],
+                             scope=limit["scope"], reset_at=err.reset_at, message=err.message[:300], detail=message,
+                             waits=int((self.store.load_state().get("plan_limit") or {}).get("waits") or 0))
+        if aid:
+            self._set(aid, status="interrupted", detail=f"plan limit: {message}", finished_at=utcnow_iso())
+
+    def _plan_limit_error(self) -> ProviderError:
+        """The job's stop at the model-specific plan limits it met (its agents on those models are resumable)."""
+        resets = sorted(b["reset_at"] for b in self.blocked_models.values() if b.get("reset_at"))
+        return ProviderError(ErrorKind.PLAN_LIMIT, "; ".join(b["message"] for b in self.blocked_models.values()),
+                             reset_at=resets[-1] if resets else None)
+
+    def _blocked(self, ids: list[str]) -> bool:
+        """Whether a model-specific plan limit stopped any of these agents in this job."""
+        if not self.blocked_models:
+            return False
+        state = self.store.load_state()
+        return any(state["agents"].get(a, {}).get("status") != "complete"
+                   and state["agents"].get(a, {}).get("model") in self.blocked_models for a in ids)
+
+    def _raise_if_blocked(self, ids: list[str]) -> None:
+        """A step whose agents a model-specific plan limit stopped is not complete: stop the job before the next
+        stage reads it (a verification batch stays planned, so a resume runs its interrupted verifiers)."""
+        if self._blocked(ids):
+            raise self._plan_limit_error()
+
+    def _may_wait(self, reset_at: str | None, limit: dict | None = None, until: dt.datetime | None = None) -> bool:
+        """Whether the run may wait for this plan-limit reset: waits for one reset window count once (several
+        agents hit the same limit), and at most plan_limit.max_waits_per_run windows are waited out per run. A
+        window without a reported reset time is keyed by model (for a model-specific limit) and limit type: hits
+        while its wait lasts count once, so parallel agents use one wait, and a hit after it is a new window."""
+        cap = self.cfg.plan_limit.max_waits_per_run
+        if cap is None:
+            return True
+        limit = limit or {}
+        prefix = (f"unknown:{limit.get('model') if limit.get('scope') == 'model' else 'account'}:"
+                  f"{limit.get('type') or 'limit'}@")
+        now = utcnow()
+        allowed = []
+
+        def same(window: str) -> bool:
+            if reset_at:
+                return window == reset_at
+            end = parse_iso(window[len(prefix):]) if window.startswith(prefix) else None
+            return end is not None and now < end
+
+        def mutate(st: dict) -> None:
+            pl = st.setdefault("plan_limit", {"waits": 0, "windows": []})
+            if any(same(w) for w in pl.get("windows", [])):
+                allowed.append(True)
+            elif int(pl.get("waits") or 0) < cap:
+                pl["waits"] = int(pl.get("waits") or 0) + 1
+                pl.setdefault("windows", []).append(reset_at or prefix + (until or now).isoformat(timespec="seconds"))
+                allowed.append(True)
+        self.store.update_state(mutate)
+        return bool(allowed)
 
     # ------------------------------------------------------------ completion
 
@@ -576,15 +810,29 @@ class Pipeline:
             self._exclude_shingles = exclude
         return self._exclude_shingles
 
-    def _note_plan_usage(self, info: dict | None) -> None:
-        if isinstance(info, dict) and info:
-            self.store.update_state(lambda st: st.__setitem__("plan_usage", {**info, "observed_at": utcnow_iso()}))
+    def _note_plan_usage(self, info: dict | None, model: str | None = None) -> None:
+        """The latest plan windows Claude Code reported, and the model whose call reported them. Model-specific
+        windows are kept per model (Opus events omit Fable's), here and for the next runs (record_plan_windows)."""
+        if not (isinstance(info, dict) and info):
+            return
+        now = utcnow_iso()
+        windows = model_windows(info, now) if model else {}
+
+        def mutate(st: dict) -> None:
+            known = dict((st.get("plan_usage") or {}).get("model_windows") or {})
+            if windows:
+                known[model] = {**known.get(model, {}), **windows}
+            st["plan_usage"] = {**info, "observed_at": now, "model": model,
+                                **({"model_windows": known} if known else {})}
+        self.store.update_state(mutate)
+        if windows:
+            record_plan_windows(model, windows)
 
     def _record_usage(self, spec: AgentSpec, attempt: int, result: AgentResult | None, err: ProviderError | None,
                       wall_s: float, stage: str | None = None, model: str | None = None,
                       effort: str | None = None) -> None:
         self._note_plan_usage((result.runtime if result else {}).get("rate_limit") if result
-                              else (err.detail or {}).get("rate_limit") if err else None)
+                              else (err.detail or {}).get("rate_limit") if err else None, model or spec.model_id)
         usage = result.usage if result else (err.usage if err else None)
         self.store.record_usage({
             "agent_id": spec.agent_id, "role": spec.role, "round": spec.round, "attempt": attempt,
@@ -598,6 +846,7 @@ class Pipeline:
             "duration_ms": result.duration_ms if result and result.duration_ms else int(wall_s * 1000),
             "duration_api_ms": result.duration_api_ms if result else None,
             "num_turns": result.num_turns if result else None,
+            "hidden_turns": result.hidden_turns if result else None,
         })
 
     async def _postprocess(self, spec: AgentSpec, result: AgentResult, ctx: BuiltContext) -> bool:
@@ -646,6 +895,7 @@ class Pipeline:
             "reported_cost_usd": result.reported_cost_usd,
             "duration_s": round((result.duration_ms or 0) / 1000, 1),
             "num_turns": result.num_turns,
+            **({"hidden_turns": result.hidden_turns} if result.hidden_turns else {}),
             "structured_block": as_written,  # as the agent wrote it; the gate may still recover the data
             "isolation_audit": audit["status"],
             "warnings": result.warnings,
@@ -678,7 +928,8 @@ class Pipeline:
             "agent_id": aid, "role": spec.role, "attempt": attempt, "report": self.store.rel(report_path),
             "prompt": {"name": ctx.prompt.name, "sha256": ctx.prompt.sha256}, "verdict": "pending",
             "facts": {"stop_reason": result.stop_reason, "requested_model": spec.model_id,
-                      "served_models": result.served_models, "provider_warnings": result.warnings, "audit": audit},
+                      "served_models": result.served_models, "provider_warnings": result.warnings, "audit": audit,
+                      "hidden_turns": result.hidden_turns},
             "checks": [], "history": [{"at": utcnow_iso(), "event": "saved"}]})
         if audit["status"] != "pass":
             self.store.event("isolation_audit_failed", agent_id=aid, status=audit["status"],
@@ -726,18 +977,26 @@ class Pipeline:
                     st = await self._repair(spec, text, st, prompt)
                 checks.append(gates.check_structured(st))
             checks.append(gates.check_truncation(facts.get("stop_reason"), st.source == "ok", gcfg.truncation))
+            if facts.get("hidden_turns"):  # earlier turns' text is not in the report: is its start missing?
+                lead = gates.leading_section(prompt.body)
+                checks.append(gates.check_hidden_turns(  # a block that is there but invalid still ends the report
+                    facts["hidden_turns"], lead, gates.has_heading(text, lead) if lead else None,
+                    not _is_structured(spec, prompt) or st.source in ("ok", "ok:lenient") or gates.wrote_block(text)))
             # Targeted calls (a coverage supplement, a placement fix) are made only for an output that nothing
             # else blocks: an output that is quarantined anyway is not worth another call.
             blocked = any(c.result == gates.BLOCK for c in checks)
             if role in ("judge", "adjudicator") and st.usable:
                 expected = self._expected_objections(aid) if role == "judge" else self._expected_items(spec)
+                tests = self._expected_tests(prompt) if role == "judge" else []
                 if not blocked:
-                    st, notes = await self._complete_coverage(spec, text, st, expected)
+                    st, notes = await self._complete_coverage(spec, text, st, expected, tests)
                     if notes:
                         checks.append(gates.Check("coverage_supplement", gates.WARN, "quality", "; ".join(notes)))
                 list_key, key = gates.coverage_keys(role)
                 checks.append(gates.check_coverage(st.data.get(list_key) or [], expected,
                                                    gcfg.judge_coverage.min_fraction, key))
+                if tests:
+                    checks.append(gates.check_rubric_rulings(st.data.get("rubric_rulings"), tests))
             mode = {"synthesis": gcfg.sections.synthesis, "critic": gcfg.sections.critic,
                     "recheck": gcfg.sections.critic, "revision": "block_any"}.get(role, "warn")
             required = gates.required_sections(prompt.body)
@@ -780,6 +1039,7 @@ class Pipeline:
         if st.usable:
             atomic_write_json(self.store.sidecar_path(aid, role, ".json"), {
                 "agent_id": aid, "data": st.data, "objections": objections, "judgments": judgments,
+                "rubric_rulings": rubric_rulings(st.data) if role == "judge" else [],
                 "structured": {"source": st.source, "as_written": st.as_written, "warnings": st.warnings}})
         gate = read_json(gate_path) or gate
         summary = {"verdict": "quarantine" if result == gates.BLOCK else result, "at": utcnow_iso(),
@@ -865,6 +1125,11 @@ class Pipeline:
         record = read_json(followup.round_dir(self.store, spec.round) / "items.json", {}) or {}
         return {it["id"] for it in record.get("items") or [] if it["route"] == "adjudicate"}
 
+    def _expected_tests(self, prompt: PromptTemplate) -> list[dict]:
+        """The rubric tests a judge must rule on: the run rubric's declared tests, when its prompt asks for rubric
+        rulings (front matter `rubric_tests: true`, judge_v3); none otherwise."""
+        return run_rubric_tests(self.store, self.cfg) if prompt.meta.get("rubric_tests") else []
+
     def _expected_objections(self, judge_id: str) -> set[str]:
         """Objection IDs of the refuter reports this judge was actually given (from its context manifest)."""
         ctx = read_json(self.store.sidecar_path(judge_id, "judge", ".context.json"), {}) or {}
@@ -911,11 +1176,12 @@ class Pipeline:
         self.store.event("repair_accepted", agent_id=aid, mode=st.repair_mode)
         return gates.accept_repair(role, text, st.as_written, data, st.repair_mode or "transcribe", warnings)
 
-    async def _complete_coverage(self, spec: AgentSpec, text: str, st: gates.Structured,
-                                 expected: set[str]) -> tuple[gates.Structured, list[str]]:
-        """Every expected ID classified exactly once. Repeats with one severity merge for free; IDs left out, or
-        given two severities, go to one targeted supplement call on the agent's own model, whose rulings replace
-        them in its data (and whose reasoning is appended to its report)."""
+    async def _complete_coverage(self, spec: AgentSpec, text: str, st: gates.Structured, expected: set[str],
+                                 tests: list[dict] | None = None) -> tuple[gates.Structured, list[str]]:
+        """Every expected ID classified exactly once, and (judge_v3) every declared rubric test ruled on once,
+        validly. Repeats with one severity (or one ruling) merge for free; IDs or tests left out, given two
+        severities, or ruled on invalidly go to one targeted supplement call on the agent's own model, whose
+        rulings replace them in its data (and whose reasoning is appended to its report)."""
         list_key, key = gates.coverage_keys(spec.role)
         entries = [e for e in st.data.get(list_key) or [] if isinstance(e, dict)]
         status = gates.coverage_status(entries, key, expected)
@@ -923,19 +1189,38 @@ class Pipeline:
         if status["repeated"]:
             entries = gates.drop_ids(entries, key, set(status["repeated"]), keep_first=True)
             notes.append("classified twice with the same severity (merged): " + ", ".join(status["repeated"]))
+        rulings = st.data.get("rubric_rulings")
+        wanted_tests: dict[str, str] = {}  # test ID -> what is wrong with its ruling
+        if tests:
+            rs = gates.rubric_status(rulings, tests)
+            if rs["repeated"]:
+                rulings = gates.keep_rubric_rulings(rulings, set(rs["repeated"]), keep_first=True)
+                notes.append("rubric tests ruled on twice the same way (merged): " + ", ".join(rs["repeated"]))
+            wanted_tests = {**{t: "not ruled on in your report" for t in rs["missing"]},
+                            **{t: f"your ruling is invalid ({p})" for t, p in rs["invalid"].items()},
+                            **{t: "you ruled on it twice, differently; give it one ruling" for t in rs["conflicts"]}}
         wanted = sorted(set(status["missing"]) | set(status["conflicts"]))
-        if wanted and self.cfg.gates.coverage_supplement.enabled:
-            sup = await self._supplement(spec, text, wanted, status["conflicts"])
+        if (wanted or wanted_tests) and self.cfg.gates.coverage_supplement.enabled:
+            sup = await self._supplement(spec, text, wanted, status["conflicts"], wanted_tests, tests or [])
             if sup is not None:
                 entries = gates.drop_ids(entries, key, set(sup["ids"])) + list(sup["entries"])
-                notes += ["ruled on in a coverage supplement: " + ", ".join(sup["ids"])] + list(sup.get("warnings") or [])
+                done_tests = list(sup.get("tests") or [])
+                if done_tests:
+                    rulings = gates.keep_rubric_rulings(rulings, set(done_tests)) + list(sup.get("rubric_rulings") or [])
+                notes += ["ruled on in a coverage supplement: " + ", ".join(list(sup["ids"]) + done_tests)] \
+                    + list(sup.get("warnings") or [])
         if not notes:
             return st, []
-        return dataclasses.replace(st, data={**st.data, list_key: entries}, warnings=st.warnings + notes), notes
+        data = {**st.data, list_key: entries}
+        if tests:
+            data["rubric_rulings"] = rulings if isinstance(rulings, list) else []
+        return dataclasses.replace(st, data=data, warnings=st.warnings + notes), notes
 
-    async def _supplement(self, spec: AgentSpec, text: str, wanted: list[str], conflicts: dict) -> dict | None:
-        """One call on the agent's own model and effort that rules on exactly `wanted`, seeing only the reports
-        that raised them and its own report. Its record (with the accepted rulings) lives in the gate sidecar."""
+    async def _supplement(self, spec: AgentSpec, text: str, wanted: list[str], conflicts: dict,
+                          wanted_tests: dict[str, str] | None = None, tests: list[dict] | None = None) -> dict | None:
+        """One call on the agent's own model and effort that rules on exactly `wanted` (and the rubric tests in
+        `wanted_tests`), seeing only the reports that raised them (and those tests) and its own report. Its record
+        (with the accepted rulings) lives in the gate sidecar."""
         aid, role = spec.agent_id, spec.role
         scfg = self.cfg.gates.coverage_supplement
         gate_path = self.store.gate_path(aid, role)
@@ -946,21 +1231,29 @@ class Pipeline:
             return rec
         if rec.get("outcome") in ("rejected", "failed"):
             return None
-        noun = "objections" if role == "judge" else "follow-up items"
+        wanted_tests = wanted_tests or {}
+        noun = ("objections" if role == "judge" else "follow-up items") if not wanted_tests else \
+            "objections and rubric tests" if wanted else "rubric tests"
+        texts = {t["id"]: t["text"] for t in tests or []}
         asks = [f"- {i}: " + (f"you gave it {' and '.join(SEVERITY_LABEL.get(x, str(x)) for x in dict.fromkeys(conflicts[i]))}"
                               "; give it one ruling" if i in conflicts else "not classified in your report")
                 for i in wanted]
+        asks += [f"- {t}: rubric test, {why}; rule on it in rubric_rulings (does it apply: yes, no or partly; its "
+                 f"severity if it applies). The test: {texts.get(t, '')[:400]}" for t, why in sorted(wanted_tests.items())]
         sup_prompt = load_prompt(scfg.prompt)
         request = sup_prompt.render({"agent_id": aid, "noun": noun, "ids": "\n".join(asks),
                                      "shape": gates.json_shape(load_prompt(spec.prompt_name).body)})
         state = self.store.load_state()
-        ctx = ContextBuilder(self.store, self.cfg, self.registry).build_supplement(spec, state, wanted, text, request)
-        rec.update(ids=wanted, conflicts=conflicts, prompt_version=sup_prompt.name, prompt_sha256=sup_prompt.sha256,
+        ctx = ContextBuilder(self.store, self.cfg, self.registry).build_supplement(
+            spec, state, wanted, text, request, [t for t in tests or [] if t["id"] in wanted_tests])
+        rec.update(ids=wanted, conflicts=conflicts, tests=sorted(wanted_tests), prompt_version=sup_prompt.name,
+                   prompt_sha256=sup_prompt.sha256,
                    inputs=[f"{m['kind']}:{m.get('agent_id') or m.get('path')}" for m in ctx.manifest])
         result, problems = await self._side_call(
             spec, gate, "supplement", model=spec.model_alias, effort=spec.effort, system=ctx.system_prompt,
             user=ctx.user_text, allowed_text=ctx.allowed_text, timeout_minutes=scfg.timeout_minutes,
-            max_attempts=scfg.max_attempts, detail=f"ruling on {len(wanted)} {noun} the report left open",
+            max_attempts=scfg.max_attempts,
+            detail=f"ruling on {len(wanted) + len(wanted_tests)} {noun} the report left open",
             tools=ctx.tools, pdf_path=ctx.pdf_path, tool_server=ctx.tool_server)
         if result is None:
             self.store.event("supplement_failed", agent_id=aid, errors=rec.get("errors", []))
@@ -968,18 +1261,25 @@ class Pipeline:
         data, _ = gates.parse_json_strict(result.text)
         if data is None:
             data, _ = gates.parse_json_lenient(result.text)
-        entries, rejections, warnings = gates.validate_supplement(role, data, wanted)
+        entries, rejections, warnings = gates.validate_supplement(role, data, wanted) if wanted else ([], [], [])
+        test_rulings: list[dict] = []
+        if wanted_tests:
+            test_rulings, rejected, noted = gates.validate_rubric_supplement(data, sorted(wanted_tests))
+            missing = sorted(set(wanted_tests) - {r["test_id"] for r in test_rulings})
+            rejections += rejected + ([f"the supplement did not rule on {', '.join(missing)}"]
+                                      if missing and not rejected else [])
+            warnings += noted
         rejections += problems
         if rejections:
             rec.update(outcome="rejected", rejections=rejections)
             atomic_write_json(gate_path, gate)
             self.store.event("supplement_rejected", agent_id=aid, rejections=rejections)
             return None
-        rec.update(outcome="accepted", entries=entries, warnings=warnings,
+        rec.update(outcome="accepted", entries=entries, rubric_rulings=test_rulings, warnings=warnings,
                    prose=gates.prose_without_block(result.text))
         atomic_write_json(gate_path, gate)
         self._append_supplement(spec, rec)
-        self.store.event("supplement_accepted", agent_id=aid, ids=wanted)
+        self.store.event("supplement_accepted", agent_id=aid, ids=wanted + sorted(wanted_tests))
         return rec
 
     def _append_supplement(self, spec: AgentSpec, rec: dict) -> None:
@@ -987,9 +1287,13 @@ class Pipeline:
         if gates.ADDENDUM in body:
             return
         noun = "objections" if spec.role == "judge" else "items"
+        tests = list(rec.get("tests") or [])
+        left = ", ".join(list(rec["ids"]) + tests)
+        noun = f"{noun} and rubric tests" if tests and rec["ids"] else "rubric tests" if tests else noun
         addendum = (f"{gates.ADDENDUM}\n## Coverage supplement (requested by the orchestrator)\n\n"
-                    f"{spec.agent_id}'s report left these {noun} unclassified or gave them two severities: "
-                    f"{', '.join(rec['ids'])}. The orchestrator asked the same model to rule on exactly these, "
+                    f"{spec.agent_id}'s report left these {noun} unclassified or gave them two severities"
+                    + (" (or invalid rulings)" if tests else "")
+                    + f": {left}. The orchestrator asked the same model to rule on exactly these, "
                     "showing it only the reports that raised them; its rulings replace any earlier ones for these "
                     f"IDs.\n\n{rec.get('prose') or ''}")
         self._rewrite_report(spec, strip_marker(body).rstrip() + "\n\n" + addendum, "coverage supplement appended")
@@ -1118,6 +1422,9 @@ class Pipeline:
                     await self._stagger()
                     if self.cancel.is_set() or self.fatal:
                         raise GateInterrupted()
+                    if info.id in self.blocked_models:
+                        self._set(aid, detail=f"{detail}: {self.blocked_models[info.id]['message']}")
+                        raise GateInterrupted()
                     rec["attempts"] = int(rec.get("attempts") or 0) + 1  # counted only when a call is made
                     atomic_write_json(gate_path, gate)
                     log_dir = self.store.agent_log_dir(aid) / f"attempt-{attempt}" / f"{key}-{rec['attempts']}"
@@ -1139,7 +1446,12 @@ class Pipeline:
                     self.cancel.set()
                     raise GateInterrupted() from err
                 if err.kind is ErrorKind.PLAN_LIMIT:
-                    if await self._wait_plan_limit(None, err.message, err.reset_at) is None:
+                    if await self._wait_plan_limit(None, err, info.id) is None:
+                        stop = (self.blocked_models.get(info.id) or {}).get("message") or (
+                            self.fatal.message if self.fatal is not None and self.fatal.kind is ErrorKind.PLAN_LIMIT
+                            else None)  # names the model, the limit type and the reset (_plan_stop)
+                        self._set(aid, detail=f"{detail}: plan limit: {stop}" if stop else
+                                  f"{detail}: stopped at a plan limit ({err.message[:200]}); resume_run finishes it")
                         raise GateInterrupted() from err
                     continue
                 rec.setdefault("errors", []).append(f"{err.kind.value}: {err.message[:200]}")
@@ -1236,6 +1548,9 @@ class Pipeline:
         except Exception as exc:
             self.store.event("evidence_check_failed", agent_id=aid, error=f"{type(exc).__name__}: {exc}")
             return
+        old = read_json(sidecar)
+        if old and {**old, "checked_at": None} == {**record, "checked_at": None}:
+            return  # a recheck that found nothing new: the readers' input (and its hash) stays as it was
         atomic_write_json(sidecar, record)
         counts: dict[str, int] = {}
         for entry in record["objections"].values():
@@ -1244,8 +1559,9 @@ class Pipeline:
         self._set(aid, evidence=counts)
 
     async def ensure_evidence(self, refresh: bool = False) -> None:
-        """Check every complete novelty refuter's quotes; with refresh, recheck objections that were unverifiable
-        (a full text may have been supplied since)."""
+        """Check every complete novelty refuter's quotes; with refresh, recheck a refuter with objections that were
+        unverifiable (a full text may have been supplied since). Its record is rewritten only when a result changed
+        (_evidence), so a recheck that finds nothing new leaves the judges' and the memo's inputs as they were."""
         state = self.store.load_state()
         for aid, a in sorted(state["agents"].items()):
             if self.cancel.is_set():
@@ -1255,8 +1571,8 @@ class Pipeline:
             path = self.store.sidecar_path(aid, "novelty", ".evidence.json")
             if path.is_file():
                 record = read_json(path, {}) or {}
-                stale = any(e.get("decisive") and e.get("status") in ("fulltext_unavailable", "prior_not_found",
-                                                                      "no_evidence", "quotes_not_found")
+                stale = any(e.get("status") in ("fulltext_unavailable", "prior_not_found", "no_evidence",
+                                                "quotes_not_found")  # decisive, or checked because it quotes
                             for e in (record.get("objections") or {}).values())
                 if not (refresh and stale):
                     continue
@@ -1299,18 +1615,87 @@ class Pipeline:
             return []
         return await self.plan_verification("refuters" if n == 0 else f"refuters{n + 1}", pending)
 
-    def finish_refuter_batches(self) -> dict[str, str]:
+    def finish_open_batches(self) -> dict[str, str]:
+        """After the verifier stage, fold in every base-review batch whose verifiers ran since it was last finished:
+        one still planned (interrupted), or one recorded incomplete whose failed or interrupted verifiers this job
+        reran. That covers the refuters', gate and user batches alike (a follow-up round finishes its own). The
+        evidence gate is recomputed when any batch was finished. Returns the refuters' batches' statuses."""
         state = self.store.load_state()
         batches = (state.get("verification") or {}).get("batches") or {}
+        tasks = (read_json(self.store.role_dir("verifier") / "results.json", {}) or {}).get("tasks") or {}
+        collected = {t.get("agent_id") for t in tasks.values() if t.get("status") == "complete"}
+        finished = False
         for k, b in batches.items():
-            if k.startswith("refuters") and b.get("status") == "planned":
+            if budget_pool(k) == "followup":
+                continue
+            rerun = b.get("status") == "incomplete" and any(
+                state["agents"].get(a, {}).get("status") == "complete" and a not in collected
+                for a in b.get("agents") or [])
+            if b.get("status") == "planned" or rerun:
                 self.finish_verification(k)
+                finished = True
+        if finished:
+            self.build_matrix()
         batches = (self.store.load_state().get("verification") or {}).get("batches") or {}
         return {k: b.get("status") for k, b in batches.items() if k.startswith("refuters")}
 
     def _batch_requests(self, batch_id: str) -> list[VerificationRequest]:
         raw = read_json(self.store.role_dir("verifier") / "batches" / f"{batch_id}.requests.json", []) or []
-        return [VerificationRequest(**{**r, "origin_ids": tuple(r.get("origin_ids") or [])}) for r in raw]
+        return [VerificationRequest(**{**r, "origin_ids": tuple(r.get("origin_ids") or []),
+                                       "alt_quotes": tuple(tuple(x) for x in r.get("alt_quotes") or [])}) for r in raw]
+
+    async def _auto_gate_step(self) -> bool:
+        """The automatic gate batch inside a job; False if the job was cancelled meanwhile."""
+        await self.auto_gate_verification()
+        if self.fatal:
+            raise self.fatal
+        return not self.cancel.is_set()
+
+    async def auto_gate_verification(self) -> None:
+        """After the judges (and again before the memo, to finish one that was cut short): when the evidence gate
+        flags serious prior-work verdicts on objections that no batch was ever asked to check (the judges escalated
+        objections their refuters rated minor), run one gate batch for them within the gate/user budget, then
+        recompute the gate. The judges are not rerun. Once per run (verifier.auto_gate_batch); an interrupted one
+        is finished, never planned twice, and one whose verifiers failed in an earlier job reruns them (once per
+        job: a verifier that failed in this job waits for the next)."""
+        vc = self.cfg.verifier
+        state = self.store.load_state()
+        ver = state.get("verification")
+        if ver is None or vc is None or not vc.enabled or not vc.auto_gate_batch:
+            return
+        batch_id = ver.get("auto_gate")
+        batch = (ver.get("batches") or {}).get(batch_id) or {} if batch_id else {}
+        retry = batch.get("status") == "incomplete" and any(state["agents"].get(a, {}).get("status") in RUNNABLE
+                                                            and a not in self._ran for a in batch.get("agents") or [])
+        if batch_id is None:
+            self.build_matrix()
+            never = set((read_json(self.store.role_dir("judge") / "evidence_gate.json", {}) or {})
+                        .get("never_requested") or [])
+            reqs = gate_requests(self.store, state, never) if never else []  # with references past the limit
+            if not reqs:
+                return
+            batches = ver.get("batches") or {}
+            batch_id = next(f"gate{n}" for n in range(1, len(batches) + 2) if f"gate{n}" not in batches)
+            atomic_write_json(self.store.role_dir("verifier") / "batches" / f"{batch_id}.requests.json",
+                              [{**dataclasses.asdict(r), "origin_ids": list(r.origin_ids)} for r in reqs])
+            self.store.update_state(lambda st: st["verification"].__setitem__("auto_gate", batch_id))
+            self.store.event("auto_gate_batch", batch=batch_id, objections=sorted(never), requests=len(reqs))
+        elif batch.get("status") in BATCH_DONE and not retry:
+            return
+        ids = [a for a in await self.plan_verification(batch_id, self._batch_requests(batch_id)) if a not in self._ran]
+        batch = (self.store.load_state().get("verification") or {}).get("batches", {}).get(batch_id)
+        if batch is not None and not batch.get("reason"):  # kept by whichever step finishes the batch
+            note = "automatic, after the judges: objections they rated serious that were never sent for a check"
+            self._set_batch(batch_id, {**batch, "reason": note})
+        if ids:
+            state = self.store.load_state()
+            await self.preflight([], [spec_from_state(state["agents"][a]) for a in ids])
+            await self._run_ids(ids)
+            if self.fatal or self.cancel.is_set():
+                return  # the batch stays planned; the next job finishes it
+            self._raise_if_blocked(ids)  # likewise, and the memo waits for it
+        self.finish_verification(batch_id)
+        self.build_matrix()
 
     async def plan_verification(self, batch_id: str, requests: list[VerificationRequest] | None = None,
                                 rnd: int = 0) -> list[str]:
@@ -1484,7 +1869,7 @@ class Pipeline:
         own = [spec_from_state(state["agents"][a]) for a in rnd["adjudicators"] + [rnd["revision"], rnd["recheck"]]]
         await self.preflight([], own)
 
-        requests = followup.verification_requests(record)
+        requests = followup.verification_requests(record, ledger_claim_map(self.store))
         if requests and self.cfg.verifier is not None and self.cfg.verifier.enabled:
             self._round(r, status="verifying")
             batch = f"critic{r}"
@@ -1493,6 +1878,9 @@ class Pipeline:
                 state = self.store.load_state()
                 await self.preflight([], [spec_from_state(state["agents"][a]) for a in ids])
                 await self._run_ids(ids)
+                if self._blocked(ids):  # the batch stays planned; a resume runs its interrupted verifiers
+                    self._round(r, status="incomplete", message=self._plan_limit_error().message)
+                    return {"outcome": "incomplete", "round": r, "message": self._plan_limit_error().message}
             self.finish_verification(batch)
         steps = (("adjudicating", rnd["adjudicators"]), ("revising", [rnd["revision"]]),
                  ("rechecking", [rnd["recheck"]]))
@@ -1505,6 +1893,9 @@ class Pipeline:
             await self._run_ids(ids)
             if self.fatal:
                 raise self.fatal
+            if self._blocked(ids):  # the next step would read an incomplete step: stop, resumable after the reset
+                self._round(r, status="incomplete", message=self._plan_limit_error().message)
+                return {"outcome": "incomplete", "round": r, "message": self._plan_limit_error().message}
             state = self.store.load_state()
             done = [a for a in ids if state["agents"][a]["status"] == "complete"]
             if not done:
@@ -1524,6 +1915,21 @@ class Pipeline:
 
     def build_matrix(self) -> dict | None:
         return build_matrix(self.store)
+
+    def note_search_health(self) -> dict | None:
+        """Record which literature providers answered the refuters (state['search_health'], from their search logs);
+        emit 'search_degraded' when one was unavailable for a material share of calls (once per change)."""
+        state = self.store.load_state()
+        record = search_health(self.store, state)
+        before = state.get("search_health") or {}
+        if record is None or {k: v for k, v in record.items() if k != "computed_at"} == \
+                {k: v for k, v in before.items() if k != "computed_at"}:
+            return record
+        self.store.update_state(lambda st: st.__setitem__("search_health", record))
+        if record["degraded"] and record["degraded"] != before.get("degraded"):
+            self.store.event("search_degraded", providers=record["degraded"], note=record["note"],
+                             counts={p: record["providers"][p] for p in record["degraded"]})
+        return record
 
     def write_usage_summary(self) -> None:
         records = read_jsonl(self.store.usage_path)
@@ -1587,18 +1993,54 @@ def batch_of(state: dict, agent_id: str) -> str | None:
     return next((k for k, b in batches.items() if agent_id in (b.get("agents") or [])), None)
 
 
+def stale_agents(store: RunStore, state: dict) -> dict[str, list[str]]:
+    """Complete agents whose inputs changed, became unusable (quarantined), or became available after they ran."""
+    stale: dict[str, list[str]] = {}
+    agents = state.get("agents", {})
+    for aid, a in agents.items():
+        if a["status"] != "complete":
+            continue
+        ctx = read_json(store.sidecar_path(aid, a["role"], ".context.json"), {}) or {}
+        reasons = [str(m.get("agent_id") or m.get("path")) for m in ctx.get("manifest", []) if input_changed(store, m)]
+        used = {m.get("agent_id") for m in ctx.get("manifest", []) if m.get("agent_id")}
+        reasons += [f"{u} is now {agents[u]['status']}" for u in sorted(used)
+                    if u in agents and agents[u]["status"] == "quarantined"]
+        reasons += [f"{m} became available after it ran" for m in ctx.get("missing_agents") or []
+                    if m in agents and agents[m]["status"] == "complete"]
+        if reasons:
+            stale[aid] = list(dict.fromkeys(reasons))
+    return stale
+
+
+def ledger_style(cfg) -> str:
+    """How this run's claims ledger names claims, matching the prompts that cite it (the memo, the critic and the
+    re-check critic): "L" (L1, L2, ... by position, apart from every agent ID) when each of them declares
+    `ledger_ids: L` (synthesis_v4, critic_v3, critic_recheck_v2); "intake" (the IDs the intake model wrote, C1,
+    C2, ..., as before) when none does, as in the presets that keep the older prompts; "both" for a mix."""
+    names = [cfg.synthesis.prompt, cfg.critic.prompt] + ([cfg.followup.recheck.prompt] if cfg.followup else [])
+    flags = [prompt_exists(n) and load_prompt(n).meta.get("ledger_ids") == "L" for n in names]
+    return "L" if all(flags) else "both" if any(flags) else "intake"
+
+
 def apply_intake(store: RunStore, data: dict | None) -> None:
     if not data:
         return
-    claims = data.get("claims") or []
+    style = ledger_style(store.load_config())
+    ids = {"L": " (L1, L2, ...)", "both": " (L1, L2, ..., each with the ID the intake pass gave it)", "intake": ""}
     lines = ["# Claims ledger (orchestrator intake pass)", "",
-             "A numbered list of the submission's own claims, made before any review. It is an aid for "
-             "checking coverage, not a verdict, and it may be incomplete.", ""]
-    for c in claims:
-        if isinstance(c, dict):
-            loc = f" [{c.get('location')}]" if c.get("location") else ""
-            kind = f" ({c.get('type')})" if c.get("type") else ""
-            lines.append(f"- **{c.get('id', '?')}**{kind}{loc}: {c.get('claim', '')}")
+             f"A numbered list of the submission's own claims{ids[style]}, made before any review. It is an aid "
+             "for checking coverage, not a verdict, and it may be incomplete.", ""]
+    for lid, c in ledger_entries(data):  # either ID resolves (verification.ledger_claim_map)
+        loc = f" [{c.get('location')}]" if c.get("location") else ""
+        kind = f" ({c.get('type')})" if c.get("type") else ""
+        own = str(c.get("id") or "").strip()
+        if style == "intake":
+            name = own or "?"
+        elif style == "both" and own and own != lid:
+            name = f"{lid}** = **{own}"
+        else:
+            name = lid
+        lines.append(f"- **{name}**{kind}{loc}: {c.get('claim', '')}")
     for key in ("stated_assumptions", "key_terms"):
         if data.get(key):
             lines += ["", f"## {key.replace('_', ' ').capitalize()}", ""] + [f"- {x}" for x in data[key]]
@@ -1615,6 +2057,7 @@ def build_matrix(store: RunStore) -> dict | None:
     state = store.load_state()
     objections: dict[str, list[dict]] = {}
     judgments: dict[str, list[dict]] = {}
+    rubric: dict[str, list[dict]] = {}
     unstructured, released_without_data = [], []
     for aid, a in state["agents"].items():
         if a["status"] != "complete":
@@ -1628,19 +2071,23 @@ def build_matrix(store: RunStore) -> dict | None:
             if side is None:
                 unstructured.append(aid)
                 continue
-            judgments[aid] = side.get("judgments") or []
+            own = prompt_exists(a.get("prompt")) and bool(load_prompt(a["prompt"]).meta.get("member_severity"))
+            judgments[aid] = [{**j, "own_severities": True} if own else j for j in side.get("judgments") or []]
+            rubric[aid] = side.get("rubric_rulings") or rubric_rulings(side.get("data"))
     if not judgments:
         return None
     excluded = {aid: gates.unavailable_label(aid, a) for aid, a in state["agents"].items()
                 if a["role"] in REFUTER_ROLES + ("judge",) and a["status"] != "complete"}
-    matrix = build_judgment_matrix(objections, judgments, excluded=excluded)
+    matrix = build_judgment_matrix(objections, judgments, excluded=excluded,
+                                   rubric_tests=run_rubric_tests(store, store.load_config()), rubric=rubric)
     matrix["judges_without_structured_output"] = unstructured
     matrix["refuters_without_structured_data"] = released_without_data
     gate = _evidence_gate(store, state, objections, judgments)
     if gate is not None:
         for row in matrix["rows"]:
             row["evidence"] = gate["by_objection"].get(row["id"])
-        matrix["evidence_gate"] = {k: gate[k] for k in ("flagged_ids", "require_independent_check")}
+        matrix["evidence_gate"] = {k: gate[k] for k in ("flagged_ids", "flagged_grouped_only",
+                                                        "require_independent_check")}
     atomic_write_json(store.role_dir("judge") / "judgment_matrix.json", matrix)
     atomic_write_text(store.role_dir("judge") / "judgment_matrix.md", matrix_markdown(matrix))
     return matrix
@@ -1659,16 +2106,37 @@ def _evidence_gate(store: RunStore, state: dict, objections: dict[str, list[dict
     known = {o["id"]: o for objs in objections.values() for o in objs}
     independent = cfg.evidence.require_independent_check and bool(cfg.verifier and cfg.verifier.enabled)
     gate = evaluate_evidence(judgments, known, evidence, verification, independent)
-    by_objection: dict[str, str] = {}
-    for oid, entry in evidence.items():
-        if entry.get("decisive"):
-            m = member_status(oid, evidence, verification)
-            checks = ", ".join(f"{a}: {v.replace('anticipates_', '')}" for a, v in zip(m["verifiers"], m["verdicts"]))
-            by_objection[oid] = m["quotes"].replace("_", " ") + (f"; {checks}" if checks else "")
-    gate["by_objection"] = by_objection
+    # the matrix's Evidence column: every decisive objection, every member of a serious prior-work verdict and every
+    # objection a verification was requested for, with what the gate knows (capped and never-requested included)
+    hashes = {oid: origin_hash(o) for oid, o in known.items()}
+    ids = {oid for oid, e in evidence.items() if e.get("decisive")} \
+        | {m["id"] for v in gate["verdicts"] for m in v["members"]} \
+        | {oid for r in (verification.get("requests") or {}).values() for oid in r.get("origin_ids") or []}
+    gate["by_objection"] = {oid: _evidence_cell(member_status(oid, evidence, verification, hashes, known[oid]),
+                                                verification) for oid in sorted(ids) if oid in known}
     atomic_write_json(store.role_dir("judge") / "evidence_gate.json", gate)
     atomic_write_text(store.role_dir("judge") / "evidence_gate.md", gate_markdown(gate))
     return gate
+
+
+_QUOTE_STATES = {"not_required": "no quote check required", "no_evidence": "no quotes given"}
+
+
+def _evidence_cell(m: dict, verification: dict) -> str:
+    """One objection's Evidence cell: its quote check, its blind verdicts, and what was not checked and why."""
+    quotes = _QUOTE_STATES.get(m["quotes"], m["quotes"].replace("_", " "))
+    if not m["verdicts"]:
+        return f"{quotes}; not blind-checked ({m.get('reason') or 'no request'})"
+    recs = [(verification.get("requests") or {}).get(rid) or {} for rid in m["requests"]]
+    capped = sum(1 for r in recs if r.get("status") == "not_run" and not r.get("limited")
+                 and "cap" in str(r.get("reason") or ""))
+    failed = sum(1 for r in recs if r.get("status") == "verifier_failed")
+    waiting = sum(1 for r in recs if r.get("status") == "pending")
+    checks = ", ".join(f"{a}: {v.replace('anticipates_', '')}" for a, v in zip(m["verifiers"], m["verdicts"]))
+    rest = ([f"{capped} more not run (cap)"] if capped else []) + ([f"{failed} verifier failed"] if failed else []) \
+        + ([f"{waiting} pending"] if waiting else []) \
+        + ([f"{m['limited']} beyond the per-objection limit"] if m.get("limited") else [])
+    return "; ".join([quotes, checks] + rest)
 
 
 def _verifier_quotes(text: str) -> list[str]:
@@ -1684,3 +2152,126 @@ def _verifier_quotes(text: str) -> list[str]:
                 if isinstance(pair, dict):
                     out += [str(pair.get(k) or "") for k in ("prior_passage", "submission_passage")]
     return [q for q in out if q.strip()]
+
+
+# ---------------------------------------------------------------- plan limits and plan windows
+
+
+def _limit_of(err: ProviderError, model: str) -> dict:
+    """Which plan limit an error is: {type, scope ("model" or "account"), model}. The provider says so; an error
+    without that detail is classified from its rate_limit info and message."""
+    limit = dict((err.detail or {}).get("limit") or {})
+    if not limit.get("scope"):
+        from paper_adversary.providers.claude_code import plan_limit_info
+
+        limit = plan_limit_info([err.message], (err.detail or {}).get("rate_limit"), model)
+    limit["model"] = limit.get("model") or model
+    limit.setdefault("type", None)
+    return limit
+
+
+def _model_name(registry: ModelRegistry, model_id: str) -> str:
+    """'Fable 5.1' for claude-fable-5-1 (models.yaml display name), else the ID."""
+    info = registry.by_id(model_id) if model_id else None
+    return ((info.display_name if info else "") or "").removeprefix("Claude ") or model_id or "?"
+
+
+def _stamp_iso(stamp) -> str | None:
+    if isinstance(stamp, (int, float)) and stamp > 0:
+        return dt.datetime.fromtimestamp(stamp, dt.timezone.utc).isoformat(timespec="seconds")
+    return None
+
+
+def model_windows(info: dict | None, observed_at: str) -> dict[str, dict]:
+    """The model-specific windows (MODEL_WINDOWS) one rate_limit_event reports, for the model whose call reported
+    it. A rejection in such a window counts as full use, also when unifiedWindows does not list it."""
+    info = info or {}
+    out = {name: {"utilization": w.get("utilization"), "resetsAt": w.get("resetsAt"), "observed_at": observed_at}
+           for name, w in (info.get("unifiedWindows") or {}).items() if name in MODEL_WINDOWS and isinstance(w, dict)}
+    rejected = info.get("rateLimitType") if info.get("status") == "rejected" else None
+    if rejected in MODEL_WINDOWS:
+        out[rejected] = {"utilization": 1.0, "resetsAt": (out.get(rejected) or {}).get("resetsAt") or
+                         info.get("resetsAt"), "observed_at": observed_at}
+    return out
+
+
+def plan_windows_path() -> Path:
+    return runs_root() / ".cache" / "plan_windows.json"
+
+
+def record_plan_windows(model: str, windows: dict[str, dict]) -> None:
+    """Keep the newest observation of each model-specific window for every run under this runs directory, so the
+    next run's guard knows it before any of its own calls (plan_limit.model_window_reserve)."""
+    path = plan_windows_path()
+    with FileLock(path.with_suffix(".lock")):
+        data = read_json(path, {}) or {}
+        mine = data.setdefault("models", {}).setdefault(model, {})
+        for name, w in windows.items():
+            if str(w.get("observed_at") or "") >= str((mine.get(name) or {}).get("observed_at") or ""):
+                mine[name] = w
+        atomic_write_json(path, data)
+
+
+def known_model_windows(state: dict) -> dict[str, dict[str, dict]]:
+    """The newest known use of each model-specific window: this run's observations and those of every run sharing
+    its runs directory (model ID -> window -> {utilization, resetsAt, observed_at})."""
+    out: dict[str, dict[str, dict]] = {}
+    for source in (((state.get("plan_usage") or {}).get("model_windows") or {}),
+                   ((read_json(plan_windows_path(), {}) or {}).get("models") or {})):
+        for model, windows in source.items():
+            for name, w in (windows or {}).items():
+                have = out.setdefault(model, {}).get(name)
+                if have is None or str(w.get("observed_at") or "") > str(have.get("observed_at") or ""):
+                    out[model][name] = w
+    return out
+
+
+# ---------------------------------------------------------------- search health
+
+
+def search_health(store: RunStore, state: dict) -> dict | None:
+    """Which literature providers answered the refuters whose reports later stages read: each complete refuter
+    with the literature tools, from its search log (the attempt that wrote the report). None without any calls."""
+    agents: dict[str, dict] = {}
+    for aid, a in sorted(state["agents"].items()):
+        if a["role"] not in REFUTER_ROLES or "literature" not in (a.get("tools") or []) or a["status"] != "complete":
+            continue
+        rows = read_jsonl(store.sidecar_path(aid, a["role"], ".search_log.jsonl"))
+        own = [r for r in rows if r.get("attempt") == a.get("attempts")] or rows
+        health = provider_health(own)
+        if health:
+            agents[aid] = health
+    if not agents:
+        return None
+    providers: dict[str, dict] = {}
+    for health in agents.values():
+        for name, c in health.items():
+            p = providers.setdefault(name, {"calls": 0, "answered": 0, "unavailable": 0, "first_unavailable": None,
+                                            "last_unavailable": None})
+            p["calls"] += c["calls"]
+            p["answered"] += c["answered"]
+            p["unavailable"] += c["unavailable"]
+            for key, pick in (("first_unavailable", min), ("last_unavailable", max)):
+                if c[key]:
+                    p[key] = pick(x for x in (p[key], c[key]) if x)
+    degraded = sorted(n for n, p in providers.items() if p["calls"] and p["unavailable"] / p["calls"] >= DEGRADED_SHARE)
+    return {"computed_at": utcnow_iso(), "threshold": DEGRADED_SHARE, "providers": providers, "agents": agents,
+            "degraded": degraded, "note": coverage_note(providers, agents, degraded)}
+
+
+def coverage_note(providers: dict, agents: dict, degraded: list[str]) -> str:
+    """One line for the judges, the memo and the critic when a provider was unavailable for a material share of the
+    refuters' literature calls: a fact the orchestrator recorded, not an agent's account."""
+    if not degraded:
+        return ""
+    parts = []
+    for name in degraded:
+        p = providers[name]
+        per = ", ".join(f"{aid} {h[name]['unavailable']} of {h[name]['calls']}" for aid, h in agents.items()
+                        if name in h)
+        parts.append(f"{name} was unavailable for {p['unavailable']} of {p['calls']} calls "
+                     f"({p['unavailable'] / p['calls']:.0%}; {per})")
+    answered = [n for n in providers if n not in degraded]
+    return ("Literature search coverage, recorded by the orchestrator from the novelty refuters' search logs: "
+            + "; ".join(parts) + ". Claims that no prior work exists rest mainly on "
+            + (", ".join(answered) if answered else "no provider") + ".")

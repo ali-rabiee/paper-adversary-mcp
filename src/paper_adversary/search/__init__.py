@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import email.utils
 import os
+import random
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -28,7 +31,7 @@ from paper_adversary.search.base import (
 BackendFactory = Callable[[dict], object]
 
 BACKENDS: dict[str, BackendFactory] = {
-    "openalex": lambda opts: OpenAlexBackend(opts.get("contact_email")),
+    "openalex": lambda opts: OpenAlexBackend(opts.get("contact_email"), opts.get("openalex_api_key")),
     "semantic_scholar": lambda opts: SemanticScholarBackend(opts.get("s2_api_key")),
     "arxiv": lambda opts: ArxivBackend(),
     "crossref": lambda opts: CrossrefBackend(opts.get("contact_email")),
@@ -40,44 +43,97 @@ def register_backend(name: str, factory: BackendFactory) -> None:
     BACKENDS[name] = factory
 
 
+def retry_after_seconds(value: str | None, now: float | None = None) -> float | None:
+    """A Retry-After header in either form: delta seconds, or an HTTP date."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    if value.isdigit():
+        return float(value)
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if when is None:
+        return None
+    return max(0.0, when.timestamp() - (time.time() if now is None else now))
+
+
+def budget_reset_seconds(headers) -> float | None:
+    """Seconds until a spent daily request budget resets, from rate-limit headers; None when the headers do not say
+    the budget is spent. OpenAlex (since February 2026) reports x-ratelimit-remaining (credits) and
+    x-ratelimit-remaining-usd, and x-ratelimit-reset in seconds. The pause is capped at 25 h."""
+    def number(name: str) -> float | None:
+        try:
+            return float(headers.get(name))
+        except (TypeError, ValueError):
+            return None
+
+    remaining, remaining_usd = number("x-ratelimit-remaining"), number("x-ratelimit-remaining-usd")
+    if not ((remaining is not None and remaining <= 0) or (remaining_usd is not None and remaining_usd <= 0)):
+        return None
+    reset = number("x-ratelimit-reset")
+    return min(max(reset if reset is not None else 3600.0, 60.0), 25 * 3600.0)
+
+
 class Fetcher:
-    """HTTP GET with a shared rate gate, bounded retries and a shared circuit breaker."""
+    """HTTP GET with a shared rate gate, bounded jittered retries and a shared circuit breaker.
+
+    The retry policy is the backend's (_policy): keyless Semantic Scholar backs off longer before it trips; Semantic
+    Scholar and OpenAlex trip a short half-open breaker (one probe after the pause); everything else trips for 600 s
+    (2 h on a block status). A 429 whose rate-limit headers say the daily budget is spent pauses until its reset."""
 
     def __init__(self, client: httpx2.AsyncClient, gate: RateGate, breaker: Breaker, name: str,
-                 block_statuses: tuple[int, ...] = (), max_retries: int = 2):
+                 block_statuses: tuple[int, ...] = (), max_retries: int = 2, backoff_s: float = 3.0,
+                 limit_trip_s: float = 600, half_open: bool = False):
         self.client = client
         self.gate = gate
         self.breaker = breaker
         self.name = name
         self.block_statuses = block_statuses
         self.max_retries = max_retries
+        self.backoff_s = backoff_s
+        self.limit_trip_s = limit_trip_s  # after repeated HTTP 429
+        self.half_open = half_open
 
     async def _get(self, url: str, params: dict | None, headers: dict | None):
-        if self.breaker.is_open(self.name):
-            raise ProviderUnavailable(f"{self.name} is paused after an earlier block or failure")
-        for attempt in range(self.max_retries + 1):
+        admitted = self.breaker.admit(self.name)
+        if admitted is None:
+            raise ProviderUnavailable(f"{self.name} is {self.breaker.describe(self.name)}")
+        retries = 0 if admitted == "probe" else self.max_retries  # a probe is one request
+        for attempt in range(retries + 1):
             await self.gate.wait()
             try:
                 resp = await self.client.get(url, params=params, headers=headers)
             except (httpx2.TimeoutException, httpx2.RequestError) as exc:
-                if attempt == self.max_retries:
+                if attempt == retries:
+                    if admitted == "probe":
+                        self.breaker.trip(self.name, self.limit_trip_s, type(exc).__name__, half_open=True)
                     raise ProviderUnavailable(f"{type(exc).__name__}: {exc}") from exc
                 await asyncio.sleep(2 * 2**attempt)
                 continue
             code = resp.status_code
-            if code == 404:
-                return None
             if code in self.block_statuses:
                 self.breaker.trip(self.name, 7200, f"HTTP {code}")
                 raise ProviderUnavailable(f"{self.name} answered HTTP {code}; pausing it for 2 h")
+            if code == 429 and (spent := budget_reset_seconds(resp.headers)) is not None:
+                # a provider's daily budget is spent (OpenAlex's credit headers): retrying cannot help before the reset
+                self.breaker.trip(self.name, spent, "daily budget spent (HTTP 429)")
+                raise ProviderUnavailable(f"{self.name}'s daily budget is spent; paused until its reset in "
+                                          f"{spent / 3600:.1f} h")
             if code == 429 or code >= 500:
-                if attempt == self.max_retries:
-                    self.breaker.trip(self.name, 600, f"HTTP {code}")
+                if attempt == retries:
+                    rate = code == 429
+                    self.breaker.trip(self.name, self.limit_trip_s if rate else 600, f"HTTP {code}",
+                                      half_open=rate and self.half_open)
                     raise ProviderUnavailable(f"{self.name} kept answering HTTP {code}")
-                retry_after = resp.headers.get("retry-after")
-                delay = float(retry_after) if retry_after and retry_after.isdigit() else 3 * 2**attempt
-                await asyncio.sleep(min(delay, 60))
+                wait = retry_after_seconds(resp.headers.get("retry-after"))
+                if wait is None:
+                    wait = self.backoff_s * 2**attempt * random.uniform(0.75, 1.25)
+                await asyncio.sleep(min(wait, 60))
                 continue
+            if admitted == "probe":
+                self.breaker.close(self.name)
             if code >= 400:
                 return None
             return resp
@@ -164,14 +220,23 @@ def merge_records(lists: list[list[PaperRecord]]) -> list[PaperRecord]:
     return merged
 
 
+def _policy(backend) -> dict:
+    """A backend's retry and breaker policy (attributes a backend may set; the defaults are the general ones)."""
+    return {"max_retries": getattr(backend, "max_retries", 2), "backoff_s": getattr(backend, "backoff_s", 3.0),
+            "limit_trip_s": getattr(backend, "limit_trip_s", 600), "half_open": getattr(backend, "half_open", False)}
+
+
 class LiteratureSearch:
     def __init__(self, providers: list[str], cache_root: Path, ttl_days: float = 14,
                  contact_email: str | None = None, transport: httpx2.AsyncBaseTransport | None = None):
         options = {"contact_email": contact_email or os.environ.get("PAPER_ADVERSARY_CONTACT_EMAIL") or None,
-                   "s2_api_key": os.environ.get("S2_API_KEY") or None}
+                   "s2_api_key": os.environ.get("S2_API_KEY") or None,
+                   "openalex_api_key": os.environ.get("OPENALEX_API_KEY") or None}
         unknown = [p for p in providers if p not in BACKENDS]
         if unknown:
             raise ValueError(f"unknown search providers {unknown}; known: {sorted(BACKENDS)}")
+        self.options = options
+        self.cache_root = cache_root
         self.backends = [BACKENDS[name](options) for name in providers]
         self.cache = DiskCache(cache_root / "search", ttl_days)
         self.breaker = Breaker(cache_root / "breaker")
@@ -193,7 +258,16 @@ class LiteratureSearch:
 
     def _fetcher(self, backend) -> Fetcher:
         return Fetcher(self._client, self.gates[backend.name], self.breaker, backend.name,
-                       getattr(backend, "block_statuses", ()))
+                       getattr(backend, "block_statuses", ()), **_policy(backend))
+
+    def fetcher(self, name: str, min_interval_s: float | None = None) -> Fetcher:
+        """A Fetcher for one provider with that provider's policy, also for one this search does not query
+        (full-text resolution asks OpenAlex and Semantic Scholar for open-access links)."""
+        backend = next((b for b in self.backends if b.name == name), None) or BACKENDS[name](self.options)
+        gate = self.gates.get(name) or RateGate(self.cache_root / "ratelimit", name,
+                                                backend.min_interval_s if min_interval_s is None else min_interval_s)
+        return Fetcher(self._client, gate, self.breaker, name, getattr(backend, "block_statuses", ()),
+                       **_policy(backend))
 
     async def _call(self, backend, method: str, *args) -> tuple[list[PaperRecord], str]:
         key = dumps([method, *args])
@@ -237,4 +311,35 @@ class LiteratureSearch:
                 "status": {b.name: st for b, (_, st) in zip(backends, results)}}
 
 
-__all__ = ["BACKENDS", "LiteratureSearch", "PaperRecord", "merge_records", "register_backend"]
+LITERATURE_TOOLS = ("search_literature", "lookup_paper", "find_citing_papers")
+DEGRADED_SHARE = 0.25  # a provider unavailable for this share of the calls that asked it is reported as degraded
+
+
+def provider_health(rows: list[dict]) -> dict[str, dict]:
+    """Per provider, from search_log rows of the literature tools (their 'status' per provider): the calls that
+    asked it, how many it answered (fresh or cached), how many found it unavailable (blocked, rate limited, paused
+    or failing), and when the first and last of those were. 'not supported' calls are not counted."""
+    out: dict[str, dict] = {}
+    for row in rows:
+        if row.get("tool") not in LITERATURE_TOOLS or not isinstance(row.get("status"), dict):
+            continue
+        for name, status in row["status"].items():
+            status = str(status)
+            if status == "not supported":
+                continue
+            c = out.setdefault(name, {"calls": 0, "answered": 0, "unavailable": 0, "first_unavailable": None,
+                                      "last_unavailable": None})
+            c["calls"] += 1
+            if status in ("ok", "cached"):
+                c["answered"] += 1
+                continue
+            c["unavailable"] += 1
+            at = row.get("at")
+            if at:
+                c["first_unavailable"] = min(x for x in (c["first_unavailable"], at) if x)
+                c["last_unavailable"] = max(x for x in (c["last_unavailable"], at) if x)
+    return out
+
+
+__all__ = ["BACKENDS", "DEGRADED_SHARE", "LiteratureSearch", "PaperRecord", "merge_records", "provider_health",
+           "register_backend", "retry_after_seconds"]

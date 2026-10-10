@@ -13,7 +13,12 @@ import pytest
 
 from paper_adversary.config import ProviderConfig
 from paper_adversary.providers.base import AgentRequest, ErrorKind, ProviderError
-from paper_adversary.providers.claude_code import ClaudeCodeProvider, classify_error, parse_reset_time
+from paper_adversary.providers.claude_code import (
+    ClaudeCodeProvider,
+    classify_error,
+    parse_reset_time,
+    plan_limit_info,
+)
 
 FAKE = textwrap.dedent('''\
     import json, os, sys, time
@@ -72,6 +77,38 @@ FAKE = textwrap.dedent('''\
         emit({{"type": "result", "subtype": "success", "is_error": False, "result": word, "num_turns": 1,
               "usage": {{"input_tokens": 5, "output_tokens": 1}},
               "modelUsage": {{arg("--model"): {{"inputTokens": 5, "outputTokens": 1, "contextWindow": 200000}}}}}})
+        sys.exit(0)
+    if mode == "fable_limit":  # the real rejection of 2026-09-29: Fable's own weekly window is full
+        emit({{"type": "rate_limit_event", "rate_limit_info": {{"status": "rejected", "resetsAt": 1790910000,
+              "rateLimitType": "seven_day_overage_included", "overageStatus": "rejected", "isUsingOverage": False,
+              "unifiedWindows": {{"five_hour": {{"utilization": 0.2, "resetsAt": 1790704200}},
+                                 "seven_day": {{"utilization": 0.62, "resetsAt": 1790910000}},
+                                 "seven_day_overage_included": {{"utilization": 1, "resetsAt": 1790910000}}}}}}}})
+        emit({{"type": "assistant", "error": "rate_limit", "is_api_error_message": True, "message": {{
+              "model": "<synthetic>", "content": [{{"type": "text", "text": "You've reached your Fable limit. Switch to "
+              "another model, or manage usage credits at claude.ai/settings/usage?from=cc_cli_limit_message, to "
+              "continue."}}]}}}})
+        emit({{"type": "result", "subtype": "success", "is_error": True, "terminal_reason": "api_error",
+              "api_error_status": 429, "num_turns": 1}})
+        sys.exit(1)
+    if mode == "hidden_turn":  # K1's J1: a first turn of imaginary tool calls cut at the cap, then the report
+        def turn(stop, tokens, text):
+            emit({{"type": "stream_event", "event": {{"type": "message_start", "message": {{
+                  "model": arg("--model"), "usage": {{"output_tokens": 1}}}}}}}})
+            emit({{"type": "stream_event", "event": {{"type": "content_block_delta"}}}})
+            emit({{"type": "assistant", "message": {{"model": arg("--model"), "content": [{{"type": "text",
+                  "text": text}}]}}}})
+            emit({{"type": "stream_event", "event": {{"type": "message_delta", "delta": {{"stop_reason": stop}},
+                  "usage": {{"output_tokens": tokens}}}}}})
+        turn("max_tokens", 128000, '<invoke name="Bash">ls -la /tmp</invoke>')
+        turn("end_turn", 66942, "## Overall assessment\\nok")
+    if mode in ("hidden_turn", "hidden_usage"):
+        if mode == "hidden_usage":  # an older Claude Code: no per-turn stream events
+            emit({{"type": "assistant", "message": {{"model": arg("--model"), "content": [{{"type": "text",
+                  "text": "## Overall assessment\\nok"}}]}}}})
+        emit({{"type": "result", "subtype": "success", "is_error": False, "result": "## Overall assessment\\nok",
+              "stop_reason": "end_turn", "num_turns": 2, "usage": {{"input_tokens": 6, "output_tokens": 194942,
+              "iterations": [{{"output_tokens": 66942, "type": "message"}}]}}}})
         sys.exit(0)
     served = scenario.get("served_model", arg("--model"))
     emit({{"type": "stream_event", "event": {{"type": "content_block_delta"}}}})
@@ -295,3 +332,89 @@ def test_plan_usage_line():
                                                "seven_day": {"utilization": 0.62, "resetsAt": 1790910000}},
                             "observed_at": "2026-09-29T15:15:00+00:00"})
     assert "five-hour 22% used" in line and "seven-day 62% used" in line and "paid overage off" in line
+
+
+def test_hidden_turns_are_kept_from_stream_events_and_warned(fake):
+    """K1 pilot (F28): J1, a judge without tools, spent 128,000 output tokens on a first turn of imaginary tool calls
+    that stopped at the output cap; only its second turn reached the report, and nothing flagged it."""
+    run, _ = fake
+    _, result, _ = run("hidden_turn")
+    assert result.text == "## Overall assessment\nok"
+    assert result.hidden_turns == {"count": 1, "output_tokens": 128000, "max_tokens_stops": 1, "turns": [1],
+                                   "source": "stream"}
+    assert ("1 hidden turn(s) before the final message used 128,000 output tokens; 1 of them stopped at the "
+            "output-token limit; only the final turn's text is in the report") in result.warnings
+    turns = [json.loads(x) for x in result.transcript_path.read_text().splitlines()]
+    assert [(t["turn"], t["stop_reason"], t["output_tokens"]) for t in turns if t["kind"] == "turn"] == [
+        (1, "max_tokens", 128000), (2, "end_turn", 66942)]
+
+
+def test_hidden_turns_without_stream_events_come_from_the_usage(fake):
+    run, _ = fake
+    _, result, _ = run("hidden_usage")  # the usage's iterations list only the final turn: 194,942 - 66,942
+    assert result.hidden_turns["count"] == 1 and result.hidden_turns["output_tokens"] == 128000
+    assert result.hidden_turns["source"] == "usage" and any("hidden turn" in w for w in result.warnings)
+    _, with_tools, _ = run()  # an agent that calls tools takes a turn per call: nothing is hidden
+    assert with_tools.hidden_turns is None
+
+
+def test_hidden_turns_count_only_turns_that_ended_and_agree_with_num_turns():
+    """Review (G4): a streamed message_start with no message_delta (a request Claude Code retried after a stream
+    error) counted as a hidden turn, so a judge whose block was rebuilt from its headings could be quarantined
+    although Claude Code reported one turn; and more turns than the stream showed were not counted at all."""
+    from paper_adversary.providers.base import hidden_turns
+
+    retried = [{"turn": 1, "stop_reason": None, "output_tokens": 1}, {"turn": 2, "stop_reason": "end_turn",
+                                                                      "output_tokens": 5000}]
+    assert hidden_turns(retried, 1, None, tool_less=True) is None
+    assert hidden_turns(retried, None, None, tool_less=True) is None  # num_turns not reported: still no turn
+    resent = [{"turn": 1, "stop_reason": "end_turn", "output_tokens": 900}, retried[1]]
+    assert hidden_turns(resent, 1, None, tool_less=True) is None  # one turn by Claude Code's count
+    assert hidden_turns(resent, 2, None, tool_less=True)["count"] == 1
+    cut = [{"turn": 1, "stop_reason": "max_tokens", "output_tokens": 128000}, retried[1]]
+    assert hidden_turns(cut, 1, None, tool_less=True)["count"] == 1  # a stop at the output cap always counts
+    usage = {"output_tokens": 7000, "iterations": [{"output_tokens": 5000}]}
+    unseen = hidden_turns([retried[1]], 3, usage, tool_less=True)  # the stream showed one turn of three
+    assert (unseen["count"], unseen["output_tokens"], unseen["source"]) == (2, 2000, "stream+num_turns")
+    assert hidden_turns([retried[1]], 3, usage, tool_less=False) is None  # an agent with tools takes turns
+
+
+def test_a_fable_limit_is_model_specific(fake):
+    """The rejection of 2026-09-29: seven_day_overage_included full while the account's windows were not. Only
+    that model's calls are refused, so it is told apart from an account-wide limit, with the window's reset."""
+    run, _ = fake
+    with pytest.raises(ProviderError) as err:
+        run("fable_limit")
+    assert err.value.kind is ErrorKind.PLAN_LIMIT
+    assert err.value.reset_at == dt.datetime.fromtimestamp(1790910000, dt.timezone.utc).isoformat(timespec="seconds")
+    assert err.value.detail["limit"] == {"type": "seven_day_overage_included", "scope": "model",
+                                         "model": "claude-opus-5-5"}
+
+
+@pytest.mark.parametrize("text, info, scope, kind", [
+    ("You've reached your Fable limit. Switch to another model", None, "model", "Fable limit"),
+    ("You've hit your Opus 5.5 limit", None, "model", "Opus 5.5 limit"),
+    ("You've hit your limit · resets 3pm (America/New_York)", None, "account", None),
+    ("You've hit your weekly limit · resets Oct 3, 2pm (UTC)", None, "account", None),
+    ("Claude AI usage limit reached|1759185600", {"status": "rejected", "rateLimitType": "five_hour"}, "account",
+     "five_hour"),
+    ("rate limited", {"status": "rejected", "rateLimitType": "seven_day_overage_included"}, "model",
+     "seven_day_overage_included"),
+    ("rate limited", {"status": "allowed", "rateLimitType": "seven_day_overage_included"}, "account", None),
+])
+def test_plan_limit_scope(text, info, scope, kind):
+    got = plan_limit_info([text], info, "claude-fable-5-1")
+    assert (got["scope"], got["type"], got["model"]) == (scope, kind, "claude-fable-5-1")
+
+
+def test_the_fable_window_is_labelled_with_its_model():
+    from paper_adversary.service import plan_usage_line
+
+    windows = {"five_hour": {"utilization": 0.18, "resetsAt": 1790932200},
+               "seven_day_overage_included": {"utilization": 0.15, "resetsAt": 1791514800}}
+    line = plan_usage_line({"status": "allowed", "unifiedWindows": windows, "observed_at": "2026-10-02T05:23:25+00:00",
+                            "model": "claude-fable-5-1", "model_windows": {"claude-fable-5-1": {
+                                "seven_day_overage_included": {"utilization": 0.15, "resetsAt": 1791514800}}}})
+    assert "Fable 5.1 (model-specific) weekly window 15% used" in line and "overage-included" not in line
+    old = plan_usage_line({"status": "allowed", "unifiedWindows": windows, "observed_at": "2026-10-02T05:23:25+00:00"})
+    assert "model-specific weekly window (seven_day_overage_included) 15% used" in old  # runs saved before

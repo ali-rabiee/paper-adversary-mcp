@@ -155,21 +155,63 @@ class RateGate:
 
 
 class Breaker:
-    """Shared 'provider is blocked until T' marker, so a block seen by one agent spares the others."""
+    """Shared 'provider is blocked until T' marker, so a block seen by one agent spares the others.
+
+    A half-open trip (keyless Semantic Scholar) pauses briefly, then lets a single probe request through: its
+    success closes the breaker for everyone, its failure trips it again. Other callers wait for the probe."""
+
+    PROBE_SECONDS = 90  # how long one caller's probe may take before another caller may probe
 
     def __init__(self, directory: Path):
         self.dir = directory
         directory.mkdir(parents=True, exist_ok=True)
 
+    def _read(self, name: str) -> dict:
+        return read_json(self.dir / f"{name}.json", {}) or {}
+
     def open_until(self, name: str) -> float:
-        data = read_json(self.dir / f"{name}.json", {}) or {}
-        return float(data.get("until", 0))
+        return float(self._read(name).get("until", 0))
 
     def is_open(self, name: str) -> bool:
         return self.open_until(name) > time.time()
 
-    def trip(self, name: str, seconds: float, reason: str) -> None:
-        atomic_write_json(self.dir / f"{name}.json", {"until": time.time() + seconds, "reason": reason})
+    def trip(self, name: str, seconds: float, reason: str, half_open: bool = False) -> None:
+        atomic_write_json(self.dir / f"{name}.json", {"until": time.time() + seconds, "reason": reason,
+                                                      **({"half_open": True} if half_open else {})})
+
+    def admit(self, name: str) -> str | None:
+        """'closed' (go ahead), 'probe' (go ahead as the one probe after a half-open pause), or None (paused)."""
+        data = self._read(name)
+        now = time.time()
+        if float(data.get("until", 0)) > now:
+            return None
+        if not data.get("half_open"):
+            return "closed"
+        with FileLock(self.dir / f"{name}.lock"):
+            data = self._read(name)
+            if float(data.get("until", 0)) > now:
+                return None
+            if not data.get("half_open"):
+                return "closed"
+            if float(data.get("probe_until", 0)) > now:
+                return None  # another caller's probe is under way
+            atomic_write_json(self.dir / f"{name}.json", {**data, "probe_until": now + self.PROBE_SECONDS})
+            return "probe"
+
+    def close(self, name: str) -> None:
+        """A probe succeeded: the provider answers again."""
+        with FileLock(self.dir / f"{name}.lock"):
+            if self._read(name).get("half_open"):
+                atomic_write_json(self.dir / f"{name}.json", {"until": 0, "reason": "closed after a probe"})
+
+    def describe(self, name: str) -> str:
+        """Why and for how long the provider is paused, for the tools' provider status."""
+        data = self._read(name)
+        left = float(data.get("until", 0)) - time.time()
+        why = f" ({data['reason']})" if data.get("reason") else ""
+        if left > 0:
+            return f"paused for {left:.0f} more s after an earlier block or failure{why}"
+        return f"paused while one request checks whether it answers again{why}; try again in a minute"
 
 
 class DiskCache:

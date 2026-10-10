@@ -1,0 +1,53 @@
+# The twelve evaluation slots: three per category. Each is empty until a real case, adjudicated by a
+# person, is supplied in eval/cases/<id>/ (start from eval/case_template/). Nothing in this file is
+# ground truth, and no slot is filled with generated or synthetic material.
+
+slots:
+  - slot: 1
+    category: genuine_overlap   # a submission whose central contribution a cited prior paper really anticipates
+    case: null              # e.g. eval/cases/<id>
+    status: needs_case
+  - slot: 2
+    category: genuine_overlap
+    case: null              # e.g. eval/cases/<id>
+    status: needs_case
+  - slot: 3
+    category: genuine_overlap
+    case: null              # e.g. eval/cases/<id>
+    status: needs_case
+  - slot: 4
+    category: different_prior_work   # a submission next to similar-looking prior work that is materially different
+    case: null              # e.g. eval/cases/<id>
+    status: needs_case
+  - slot: 5
+    category: different_prior_work
+    case: null              # e.g. eval/cases/<id>
+    status: needs_case
+  - slot: 6
+    category: different_prior_work
+    case: null              # e.g. eval/cases/<id>
+    status: needs_case
+  - slot: 7
+    category: valid_objection   # a submission with a technical flaw a careful reviewer should find
+    case: null              # e.g. eval/cases/<id>
+    status: needs_case
+  - slot: 8
+    category: valid_objection
+    case: null              # e.g. eval/cases/<id>
+    status: needs_case
+  - slot: 9
+    category: valid_objection
+    case: null              # e.g. eval/cases/<id>
+    status: needs_case
+  - slot: 10
+    category: incorrect_objection   # a sound submission that invites a plausible but wrong objection
+    case: null              # e.g. eval/cases/<id>
+    status: needs_case
+  - slot: 11
+    category: incorrect_objection
+    case: null              # e.g. eval/cases/<id>
+    status: needs_case
+  - slot: 12
+    category: incorrect_objection
+    case: null              # e.g. eval/cases/<id>
+    status: needs_case

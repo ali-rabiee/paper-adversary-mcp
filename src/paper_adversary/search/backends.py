@@ -33,13 +33,21 @@ class OpenAlexBackend:
     select = ("id,doi,display_name,publication_year,authorships,primary_location,cited_by_count,"
               "abstract_inverted_index,locations")
 
-    def __init__(self, contact_email: str | None = None):
+    def __init__(self, contact_email: str | None = None, api_key: str | None = None):
         self.contact_email = contact_email
+        self.api_key = api_key or os.environ.get("OPENALEX_API_KEY") or None
+        # OpenAlex bills requests against a daily budget (since February 2026): without a key it is tiny (the K2 run
+        # on 2026-10-02 saw $0.10, about 100 searches, spent after about two runs); a free key gives $1 a day. A spent
+        # budget pauses OpenAlex until the reset its headers give (Fetcher). Any other 429 burst is retried, then
+        # pauses OpenAlex for 120 s and lets one probe through, so a burst does not cost a whole novelty phase.
+        self.limit_trip_s, self.half_open = 120, True
 
     def _params(self, **extra) -> dict:
         params = {"select": self.select, **extra}
         if self.contact_email:
             params["mailto"] = self.contact_email
+        if self.api_key:
+            params["api_key"] = self.api_key
         return params
 
     @staticmethod
@@ -118,7 +126,17 @@ class SemanticScholarBackend:
 
     def __init__(self, api_key: str | None = None):
         self.api_key = api_key or os.environ.get("S2_API_KEY") or None
-        self.min_interval_s = 1.05 if self.api_key else 1.5
+        self.min_interval_s = 1.2 if self.api_key else 1.5
+        # Without a key, requests share a public pool that answers 429 in bursts (K1 pilot: 37 of 43 calls lost to a
+        # 600 s pause): back off longer (4 jittered retries, about a minute) before tripping, then pause 90 s and let
+        # one probe through. With a key a 429 is this key's own limit (1 request/s): a keyed request spaced about
+        # 1.6 s after the previous one was still answered 429 once in a test on 2026-10-02, so the gate keeps a margin
+        # over 1 s and a 429 gets 3 retries. A 429 that outlasts them pauses Semantic Scholar for 120 s, then one
+        # probe goes through: in the K2 run (2026-10-02) a 600 s pause outlasted the whole novelty phase.
+        if self.api_key:
+            self.max_retries, self.limit_trip_s, self.half_open = 3, 120, True
+        else:
+            self.max_retries, self.backoff_s, self.limit_trip_s, self.half_open = 4, 4.0, 90, True
 
     def _headers(self) -> dict:
         return {"x-api-key": self.api_key} if self.api_key else {}

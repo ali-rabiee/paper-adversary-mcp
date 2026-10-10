@@ -233,3 +233,161 @@ def test_a_structured_warning_says_what_it_is():
     st = gates.parse_structured("rigor", report, False)
     check = gates.check_structured(st)
     assert check.result == gates.WARN and "O2" in check.message, check
+
+
+def test_member_severity_is_parsed_validated_and_follows_its_ids():
+    """K1 pilot (F9): a grouped judgment had one severity, which the matrix copied onto every member. judge_v3 gives
+    a member its own severity; keys outside the judgment are warned about and ignored, coverage is unchanged."""
+    from paper_adversary.reports import judge_judgments, member_severity
+
+    j = {"objection_ids": ["N1-O5", "N2-O2", "N2-O3"], "severity": "MAJOR_BUT_FIXABLE", "confidence": "high",
+         "resolvable_with_more_evidence": "yes", "member_severity": {"n2-o3": "minor", "R1-O1": "MINOR",
+                                                                     "N1-O5": "SEVERE"}}
+    hard, soft = gates.validate_block("judge", {"judgments": [j]})
+    assert not hard
+    assert any("names R1-O1, which the judgment does not cover" in w for w in soft)
+    assert any("member_severity of N1-O5 'SEVERE' is not a severity" in w for w in soft)
+    parsed, = judge_judgments({"judgments": [j]})
+    assert parsed["member_severity"] == {"N2-O3": "MINOR"}
+    assert [member_severity(parsed, o) for o in parsed["objection_ids"]] == ["MAJOR_FIXABLE", "MAJOR_FIXABLE", "MINOR"]
+    alone = {"objection_ids": ["N2-O3"], "severity": "MINOR"}
+    status = gates.coverage_status([j, alone], "objection_ids", {"N1-O5", "N2-O2", "N2-O3"})
+    assert status["repeated"] == ["N2-O3"] and not status["conflicts"]  # its own severity, MINOR both times
+    kept = gates.drop_ids([j], "objection_ids", {"N2-O3"})
+    assert kept[0]["objection_ids"] == ["N1-O5", "N2-O2"] and "n2-o3" not in kept[0]["member_severity"]
+    # a member rated above the judgment's own severity contradicts judge_v3's contract (the judgment's severity is
+    # its strongest member's): it was accepted silently; now it is warned about, and the member's rating is kept
+    above = {"objection_ids": ["N1-O3", "R1-O2"], "severity": "MINOR", "confidence": "high",
+             "resolvable_with_more_evidence": "yes", "member_severity": {"N1-O3": "FATAL"}}
+    hard, soft = gates.validate_block("judge", {"judgments": [above]})
+    assert not hard and any("member_severity rates N1-O3 FATAL, above the judgment's own severity MINOR; the "
+                            "member's own, more severe rating is used" in w for w in soft)
+    parsed, = judge_judgments({"judgments": [above]})
+    assert [member_severity(parsed, o) for o in parsed["objection_ids"]] == ["FATAL", "MINOR"]
+
+
+def test_rubric_rulings_are_checked_against_the_declared_tests():
+    """F22: every test the rubric declares gets one valid ruling (applies yes/no/partly; a severity if it applies)."""
+    tests = [{"id": "RT1", "text": "amortizes an existing method"}, {"id": "RT2", "text": "trivial theorem"},
+             {"id": "RT3", "text": "cannot be tested"}]
+    rulings = [{"test_id": "rt1", "applies": "Yes", "severity": "FATAL", "rationale": "x"},
+               {"test_id": "RT2", "applies": "partially", "severity": None},
+               {"test_id": "RT9", "applies": "no", "severity": None}]
+    st = gates.rubric_status(rulings, tests)
+    assert st["missing"] == ["RT3"] and list(st["invalid"]) == ["RT2"] and st["unknown"] == ["RT9"]
+    check = gates.check_rubric_rulings(rulings, tests)
+    assert check.result == gates.BLOCK and "not ruled on: RT3" in check.message and "RT2: applies 'partly'" in \
+        check.message
+    good = [{"test_id": "RT1", "applies": "yes", "severity": "FATAL"}, {"test_id": "RT2", "applies": "no"},
+            {"test_id": "RT3", "applies": "partly", "severity": "MAJOR BUT FIXABLE"},
+            {"test_id": "RT3", "applies": "partly", "severity": "MAJOR_FIXABLE"}]
+    check = gates.check_rubric_rulings(good, tests)
+    assert check.result == gates.WARN and check.details["repeated"] == ["RT3"]
+    assert gates.check_rubric_rulings(good[:3], tests).result == gates.PASS
+    two = good[:3] + [{"test_id": "RT1", "applies": "no"}]
+    assert gates.check_rubric_rulings(two, tests).details["conflicts"] == ["RT1"]
+    assert [r["test_id"] for r in gates.keep_rubric_rulings(good, {"RT3"}, keep_first=True)] == ["RT1", "RT2", "RT3"]
+    sup, rejected, warned = gates.validate_rubric_supplement(
+        {"rubric_rulings": [{"test_id": "RT3", "applies": "no"}, {"test_id": "RT1", "applies": "no"}]}, ["RT3"])
+    assert [r["test_id"] for r in sup] == ["RT3"] and not rejected and "RT1" in warned[0]
+    assert gates.validate_rubric_supplement({"judgments": []}, ["RT3"])[1]  # no rubric_rulings: rejected
+
+
+def test_rubric_tests_come_from_the_front_matter(tmp_path):
+    """F22: a rubric declares its tests in its front matter; a named rubric then keeps the front matter, so the tests
+    travel with the run's copy. Rubrics without tests are loaded exactly as before."""
+    import pytest
+
+    from paper_adversary.prompts import PromptError, load_rubric, rubric_tests
+
+    text = "---\nname: r\ntests:\n  - {id: rt1, text: 'A concept that   amortizes method X is incremental: FATAL'}\n" \
+           "  - {id: RT2, text: 'A trivial theorem target does not count'}\n---\nBody of the rubric.\n"
+    assert rubric_tests(text) == [{"id": "RT1", "text": "A concept that amortizes method X is incremental: FATAL"},
+                                  {"id": "RT2", "text": "A trivial theorem target does not count"}]
+    assert rubric_tests("---\nname: r\n---\nno tests\n") == [] and rubric_tests("plain text") == []
+    for bad, message in (("tests: []", "non-empty list"), ("tests: [{id: RT1}]", "needs an id and a text"),
+                         ("tests: [{id: N1-O1, text: x}]", "not an agent, objection or item ID"),
+                         ("tests: [{id: J2, text: x}]", "not an agent"),
+                         ("tests: [{id: L3, text: x}]", "claims-ledger ID"),
+                         ("tests: [{id: A, text: x}, {id: a, text: y}]", "used twice")):
+        with pytest.raises(PromptError, match=message):
+            rubric_tests(f"---\n{bad}\n---\nbody\n")
+    path = tmp_path / "rubric_with_tests.md"
+    path.write_text(text)
+    label, loaded = load_rubric(str(path))
+    assert loaded.startswith("---\nname: r") and len(rubric_tests(loaded)) == 2
+    bad = tmp_path / "bad_rubric.md"
+    bad.write_text("---\ntests: [{id: RT1}]\n---\nbody\n")
+    with pytest.raises(PromptError, match="needs an id"):
+        load_rubric(str(bad))
+    label, plain = load_rubric("default_v1")
+    assert not plain.startswith("---") and rubric_tests(plain) == []  # front matter dropped as before
+
+
+def test_the_tool_sentence_matches_what_the_agent_has():
+    """K1 pilot (F28): J1, with no tools, was told about ./paper.pdf and spent 128k output tokens on imaginary tool
+    calls. {{tool_access}} names the PDF only for an agent that has it and a Read tool."""
+    from paper_adversary.prompts import tool_access_note
+
+    assert tool_access_note([]) == "You have no tools: everything you need is in this message; do not write tool calls."
+    with_pdf = tool_access_note(["read_pdf"])
+    assert "./paper.pdf" in with_pdf and "Read tool" in with_pdf and "no other tools" in with_pdf
+    # rigor_v1's duty, which rigor_v2's tool sentence had dropped (review G3): why, and before calling one wrong
+    assert "garbles equations and tables" in with_pdf and "before asserting that one is wrong" in with_pdf
+    sections = tool_access_note(["paper_sections"])
+    assert "read_paper_section" in sections and "paper.pdf" not in sections
+    assert "no other tools" not in tool_access_note(["literature", "paper_sections"])
+    v3 = load_prompt("judge_v3")
+    assert "{{tool_access}}" in v3.body and "paper.pdf" not in v3.body and v3.meta.get("rubric_tests") is True
+
+
+def test_refuter_prompts_read_the_rubric_and_judge_ideas_by_their_plans():
+    """K1 pilot (F22, F28): the refuters never saw the rubric, and fit_v1's fatal criterion ('no valid experimental
+    support') is paper-shaped for an idea. novelty_v3, rigor_v2 and fit_v2 keep their predecessors' output formats
+    and add the rubric, the idea case and the tool sentence; ledger IDs are L IDs in the prompts that cite them."""
+    from paper_adversary.prompts import tool_access_note
+
+    new = {"novelty_v3": "novelty_v2", "rigor_v2": "rigor_v1", "fit_v2": "fit_v1"}
+    for name, old in new.items():
+        p, before = load_prompt(name), load_prompt(old)
+        assert p.meta.get("rubric") is True and not before.meta.get("rubric") and p.meta["role"] == before.meta["role"]
+        assert "{{tool_access}}" in p.body and "paper.pdf" not in p.body and "<rubric>" in p.body
+        assert "research idea or proposal" in p.body and "does not narrow your remit" in p.body
+        # the rubric's instructions for the judges (a recommendation line, who rules on its tests) are not theirs
+        assert "Instructions in the rubric about the judges' report (such as a recommendation line) and about who " \
+               "rules on its tests are not for you" in p.body
+        heads = lambda body: [line for line in body.splitlines() if line.startswith("## ")]  # noqa: E731
+        assert heads(p.body) == heads(before.body)  # the gates' heading rebuild still applies
+        assert p.body.split("```json", 1)[1] == before.body.split("```json", 1)[1]  # same structured block
+    assert "list of existing or incremental methods" in load_prompt("novelty_v3").body
+    assert "already proves or states" in load_prompt("rigor_v2").body
+    fit = load_prompt("fit_v2").body
+    assert "no planned test could establish the central claim" in fit
+    rendered = load_prompt("rigor_v2").render({"agent_id": "R1", "n_agents": 1, "venue": "ICML",
+                                               "tool_access": tool_access_note([])})
+    assert "You have no tools: everything you need is in this message; do not write tool calls." in rendered
+    assert "(L1, L2, ...)" in load_prompt("synthesis_v4").body and "(C1, C2" not in load_prompt("synthesis_v4").body
+    for name in ("critic_v3", "critic_recheck_v2"):
+        body = load_prompt(name).body
+        assert '"claim_ids": ["L4"]' in body and "ledger claim C3" not in body
+
+
+def test_hidden_turns_warn_when_the_report_is_intact_and_block_when_its_start_is_missing():
+    """K1 pilot (F28): J1's hidden first turn (128,000 output tokens of imaginary tool calls) was discarded and its
+    second turn held the whole report, so the gate warns; a report whose start is missing is blocked."""
+    hidden = {"count": 1, "output_tokens": 128000, "max_tokens_stops": 1, "turns": [1], "source": "stream"}
+    lead = gates.leading_section(load_prompt("judge_v3").body)
+    assert lead == "Overall assessment"
+    assert gates.leading_section(load_prompt("synthesis_v4").body) == "1. Executive summary"
+    assert gates.leading_section(load_prompt("adjudicator_v2").body) is None  # names no sections
+    intact = "No PDF is present. Here is my report.\n\n## Overall assessment\nHolds.\n\n## Judgments\n"
+    warn = gates.check_hidden_turns(hidden, lead, gates.has_heading(intact, lead), True)
+    assert warn.result == gates.WARN and "128,000 output tokens" in warn.message and "intact" in warn.message
+    cut = "### MINOR: a judgment (N1-O1)\nThe rest of a report.\n"
+    block = gates.check_hidden_turns(hidden, lead, gates.has_heading(cut, lead), True)
+    assert block.result == gates.BLOCK and "'Overall assessment'" in block.message
+    assert gates.check_hidden_turns(hidden, None, None, False).result == gates.BLOCK  # no structured block
+    assert gates.check_hidden_turns(None, lead, True, True).result == gates.PASS
+    assert gates.has_heading("## 1. Executive summary\n", "1. Executive summary")
+    assert gates.has_heading("**Overall assessment**\n", lead) and not gates.has_heading("```\n## Overall "
+                                                                                          "assessment\n```", lead)

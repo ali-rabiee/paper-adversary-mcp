@@ -1,0 +1,129 @@
+# routine: the default for new runs. A mixed Opus 5.5 / Fable 5.1 panel, mostly at high effort.
+#
+# Every role that has two agents gets one on each model, so the two models check each other: novelty and
+# rigor split their lenses between an Opus and a Fable refuter, the two judges and the two follow-up
+# adjudicators are one of each, and a decisive novelty objection is verified blind by the other model than
+# the refuter's (verifier.routing: cross_model). Max effort is not used anywhere.
+#
+# This is a proposed allocation chosen for cost, not an empirically validated optimum; compare it with
+# legacy_thorough on your own adjudicated cases (eval/README.md) before relying on it for a decision.
+
+description: Default. Mixed Opus/Fable panel at mostly high effort; 3 prior papers verified; 1 follow-up round.
+lens_set: lenses_v2
+
+orchestrator:            # intake pass: metadata + claims ledger (seen only by synthesis and critic)
+  enabled: true
+  model: opus-5.5
+  effort: medium
+  prompt: intake_v1
+  timeout_minutes: 30
+
+novelty:
+  model: opus-5.5
+  effort: high
+  agents: 2
+  prompt: novelty_v2
+  lenses: true
+  per_agent:             # agent number -> model / effort / lens (prompts/lenses_v2.yaml)
+    1: {model: opus-5.5, effort: high, lens: direct_and_recent}
+    2: {model: fable-5.1, effort: high, lens: equivalents_and_gaps}
+  tools: [web_search, web_fetch, literature, prior_text]
+  paper_format: text
+  timeout_minutes: 75
+
+rigor:
+  model: opus-5.5
+  effort: high
+  agents: 2
+  prompt: rigor_v1
+  lenses: true
+  per_agent:
+    1: {model: fable-5.1, effort: xhigh, lens: theory}
+    2: {model: opus-5.5, effort: high, lens: empirical_and_claims}
+  tools: []
+  paper_format: pdf
+  timeout_minutes: 90
+
+fit:
+  model: opus-5.5
+  effort: medium
+  agents: 1
+  prompt: fit_v1
+  lenses: true
+  per_agent:
+    1: {lens: fit_overall}
+  tools: []
+  paper_format: text
+  timeout_minutes: 60
+
+verifier:                # blind verifiers: one per prior paper behind a decisive novelty objection
+  enabled: true
+  routing: cross_model   # the verifier runs on the other model than the refuter (or critic) that raised it
+  counterpart: {opus-5.5: fable-5.1, fable-5.1: opus-5.5}
+  model: opus-5.5        # for a refuter whose model has no counterpart above
+  effort: high
+  prompt: verifier_v1
+  tools: [prior_text]
+  paper_format: text
+  timeout_minutes: 45
+  max_agents_per_batch: 3
+  max_agents_per_run: 3
+  max_papers_per_run: 3  # the most central, severe and uncertain threats first; the rest stay labelled unverified
+  blocking: false
+
+judge:
+  model: opus-5.5
+  effort: high
+  agents: 2
+  prompt: judge_v2
+  lenses: false          # judges get identical instructions; independence comes from isolation
+  per_agent:
+    1: {model: opus-5.5, effort: high}
+    2: {model: fable-5.1, effort: high}
+  tools: []
+  paper_format: pdf
+  timeout_minutes: 90
+
+synthesis:
+  model: opus-5.5
+  effort: high
+  agents: 1
+  prompt: synthesis_v3
+  tools: []
+  paper_format: text
+  timeout_minutes: 90
+
+critic:
+  model: fable-5.1
+  effort: high
+  agents: 1
+  prompt: critic_v2
+  tools: []
+  paper_format: text
+  timeout_minutes: 90
+
+followup:                # one round, started only when the critic raises an item at min_severity or above
+  auto_start: true
+  auto_continue: false
+  max_rounds: 1
+  min_severity: MAJOR_FIXABLE
+  adjudicators: 2
+  adjudicator:
+    model: opus-5.5
+    effort: high
+    prompt: adjudicator_v1
+    paper_format: pdf
+    timeout_minutes: 90
+    per_agent:           # position in the round -> model / effort
+      1: {model: opus-5.5, effort: high}
+      2: {model: fable-5.1, effort: high}
+  revision:
+    model: opus-5.5
+    effort: high
+    prompt: synthesis_revision_v2
+    timeout_minutes: 90
+  recheck:
+    model: fable-5.1
+    effort: high
+    prompt: critic_recheck_v1
+    timeout_minutes: 90

@@ -18,7 +18,7 @@ import re
 from dataclasses import asdict, dataclass, field
 
 from paper_adversary.registry import substituted_models
-from paper_adversary.reports import normalize_severity
+from paper_adversary.reports import SEVERITY_RANK, normalize_severity, rubric_ruling
 
 REFUTER_ROLES = ("novelty", "rigor", "fit")
 PASS, WARN, BLOCK = "pass", "warn", "block"
@@ -285,12 +285,29 @@ def _validate_block(role: str, data: dict) -> tuple[list[str], list[str]]:
             bad = [x for x in ids if not _OBJECTION_ID.match(x)]
             if bad:
                 hard.append(f"judgment {i}: {', '.join(bad)} are not objection IDs like N1-O3")
-            if normalize_severity(j.get("severity")) is None:
+            severity = normalize_severity(j.get("severity"))
+            if severity is None:
                 hard.append(f"judgment {i}: severity {j.get('severity')!r} is not one of the four classes")
             if _text(j.get("confidence")) not in CONFIDENCE:
                 soft.append(f"judgment {i}: confidence {j.get('confidence')!r} is not high/medium/low")
             if _text(j.get("resolvable_with_more_evidence")) not in RESOLVABLE:
                 soft.append(f"judgment {i}: resolvable_with_more_evidence is not yes/no/partially")
+            members = j.get("member_severity")
+            if members is not None and not isinstance(members, dict):
+                soft.append(f"judgment {i}: member_severity is not an object (ignored)")
+            for key, value in (members.items() if isinstance(members, dict) else []):
+                oid = re.sub(r"\s+", "", str(key)).upper()
+                if oid not in ids:  # coverage stays "each ID in exactly one judgment"; this entry is ignored
+                    soft.append(f"judgment {i}: member_severity names {oid}, which the judgment does not cover "
+                                "(ignored)")
+                elif normalize_severity(value) is None:
+                    soft.append(f"judgment {i}: member_severity of {oid} {value!r} is not a severity (ignored)")
+                elif SEVERITY_RANK[normalize_severity(value)] > SEVERITY_RANK.get(severity, 3):
+                    # a judgment's severity is its strongest member's: one of the two is wrong; keep the more severe
+                    soft.append(f"judgment {i}: member_severity rates {oid} {normalize_severity(value)}, above the "
+                                f"judgment's own severity {severity}; the member's own, more severe rating is used")
+        if data.get("rubric_rulings") is not None and not isinstance(data.get("rubric_rulings"), list):
+            soft.append("rubric_rulings is not a list")
     elif role in ("critic", "recheck"):
         items = data.get("items")
         if not isinstance(items, list):
@@ -619,6 +636,56 @@ def check_truncation(stop_reason: str | None, block_intact: bool, policy: str) -
                  "the report was cut off at the output-token limit")
 
 
+def leading_section(prompt_body: str) -> str | None:
+    """The first section heading an agent's prompt asks for (its Output format part), e.g. 'Overall assessment' or
+    '1. Executive summary'; None when the prompt names no sections."""
+    parts = prompt_body.split("# Output format", 1)
+    if len(parts) < 2:
+        return None
+    for _, _, line in _lines(_strip_fenced(parts[1])):
+        m = re.match(r"##[ \t]+(.+?)[ \t]*$", line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def has_heading(text: str, title: str) -> bool:
+    """Whether a report has this section as a heading (any level, numbered or not) or as a bold line."""
+    want = _title_key(re.sub(r"^\d+\.\s*", "", title))
+    for _, _, line in _lines(_strip_fenced(text)):
+        m = re.match(r"(?:#{1,4}[ \t]+|\*\*)(?:\d+\.[ \t]*)?(.+?)[ \t#*:]*$", line.strip())
+        if m and _title_key(m.group(1)) == want:
+            return True
+    return False
+
+
+def wrote_block(text: str) -> bool:
+    """Whether the report ends with a fenced JSON block at all, valid or not: evidence that the final turn holds the
+    report's end (check_hidden_turns), whatever the block's parse."""
+    blocks = _fences(text)
+    return bool(blocks) and blocks[-1].group(1).lower() in ("", "json")
+
+
+def check_hidden_turns(hidden: dict | None, lead: str | None, lead_ok: bool | None, block_ok: bool) -> Check:
+    """Turns before the final message whose text the report does not contain (providers.base.hidden_turns). The
+    report is the final turn's text alone: intact (WARN, the tokens are still spent), or missing its leading section
+    or its structured block, so its start may have been in a discarded turn (BLOCK). K1 pilot: J1 spent 128,000
+    output tokens on a hidden first turn of imaginary tool calls; its second turn held the whole report."""
+    if not hidden or not hidden.get("count"):
+        return Check("hidden_turns", PASS, "quality")
+    tokens = hidden.get("output_tokens")
+    what = (f"{hidden['count']} hidden turn(s) before the final message"
+            + (f" ({tokens:,} output tokens)" if tokens is not None else "")
+            + (f", {hidden['max_tokens_stops']} stopped at the output-token limit" if hidden.get("max_tokens_stops")
+               else "") + "; their text is not in the report")
+    missing = ([f"its leading section '{lead}'"] if lead_ok is False else []) + ([] if block_ok else
+                                                                                 ["its structured block"])
+    if missing:
+        return Check("hidden_turns", BLOCK, "quality", f"{what}, and the report lacks {' and '.join(missing)}: its "
+                     "start may be in a discarded turn", {**hidden, "missing": missing})
+    return Check("hidden_turns", WARN, "quality", f"{what}; the final report is intact", dict(hidden))
+
+
 def check_structured(st: Structured) -> Check:
     if st.source == "n/a":
         return Check("structured_block", PASS, "quality")
@@ -638,15 +705,23 @@ def entry_ids(entry: dict, key: str) -> list[str]:
     return _norm_ids(entry.get(key) or entry.get(key[:-1]))
 
 
+def _own_severity(entry: dict, oid: str) -> str | None:
+    """An ID's severity in a judgment: its member_severity entry (judge_v3), else the judgment's."""
+    members = entry.get("member_severity") if isinstance(entry.get("member_severity"), dict) else {}
+    own = {re.sub(r"\s+", "", str(k)).upper(): v for k, v in members.items()}
+    return normalize_severity(own.get(oid)) or normalize_severity(entry.get("severity"))
+
+
 def coverage_status(entries: list[dict], key: str, expected: set[str]) -> dict:
     """Which expected IDs a judge (key "objection_ids") or adjudicator ("item_ids") left out, gave two different
-    severities, or classified twice with the same severity; and which IDs it cited that do not exist."""
+    severities, or classified twice with the same severity; and which IDs it cited that do not exist. An ID's
+    severity is its own (member_severity) where a grouped judgment gives one."""
     seen: dict[str, list[str]] = {}
     for e in entries:
         if not isinstance(e, dict):
             continue
         for oid in entry_ids(e, key):
-            seen.setdefault(oid, []).append(normalize_severity(e.get("severity")))
+            seen.setdefault(oid, []).append(_own_severity(e, oid))
     return {"missing": sorted(expected - set(seen)),
             "conflicts": {oid: sevs for oid, sevs in sorted(seen.items()) if len(set(sevs)) > 1},
             "repeated": sorted(oid for oid, sevs in seen.items() if len(sevs) > 1 and len(set(sevs)) == 1),
@@ -669,7 +744,11 @@ def drop_ids(entries: list[dict], key: str, ids: set[str], keep_first: bool = Fa
         keep = [i for i in mine if i not in ids or (keep_first and i not in seen)]
         seen.update(mine)
         if keep:
-            out.append({**{k: v for k, v in e.items() if k != key[:-1]}, key: keep})
+            kept = {**{k: v for k, v in e.items() if k != key[:-1]}, key: keep}
+            if isinstance(e.get("member_severity"), dict):  # per-member severities follow their IDs
+                kept["member_severity"] = {k: v for k, v in e["member_severity"].items()
+                                           if re.sub(r"\s+", "", str(k)).upper() in keep}
+            out.append(kept)
     return out
 
 
@@ -739,6 +818,77 @@ def check_coverage(judgments: list[dict], expected: set[str], min_fraction: floa
     if problems:
         return Check("judge_coverage", WARN, "quality", "; ".join(problems), details)
     return Check("judge_coverage", PASS, "quality", "", details)
+
+
+def rubric_status(rulings, tests: list[dict]) -> dict:
+    """Which of the rubric's declared tests a judge's rubric_rulings leave out, rule on invalidly (no yes/no/partly,
+    or no severity for a test that applies), or rule on twice differently; repeats and unknown test IDs."""
+    ids = {t["id"] for t in tests}
+    seen: dict[str, list[tuple]] = {}
+    invalid: dict[str, str] = {}
+    unknown: set[str] = set()
+    for entry in rulings if isinstance(rulings, list) else []:
+        rec, problem = rubric_ruling(entry)
+        if rec is None:
+            continue
+        if rec["test_id"] not in ids:
+            unknown.add(rec["test_id"])
+        elif problem:
+            invalid.setdefault(rec["test_id"], problem)
+        else:
+            seen.setdefault(rec["test_id"], []).append((rec["applies"], rec["severity"]))
+    return {"missing": sorted(ids - set(seen) - set(invalid)), "invalid": dict(sorted(invalid.items())),
+            "conflicts": sorted(t for t, v in seen.items() if len(set(v)) > 1),
+            "repeated": sorted(t for t, v in seen.items() if len(v) > 1 and len(set(v)) == 1),
+            "unknown": sorted(unknown)}
+
+
+def check_rubric_rulings(rulings, tests: list[dict]) -> Check:
+    """Every test the rubric declares ruled on exactly once, validly, by a judge whose prompt asks for rubric
+    rulings (judge_v3); the pipeline first asks for a targeted supplement, then this blocks."""
+    st = rubric_status(rulings, tests)
+    problems = ([f"not ruled on: {', '.join(st['missing'])}"] if st["missing"] else []) \
+        + [f"invalid ruling: {p}" for p in st["invalid"].values()] \
+        + ([f"ruled on twice, differently: {', '.join(st['conflicts'])}"] if st["conflicts"] else [])
+    details = {"tests": [t["id"] for t in tests], **st}
+    if problems:
+        return Check("rubric_tests", BLOCK, "quality", "rubric tests: " + "; ".join(problems)[:400], details)
+    notes = ([f"tests the rubric does not declare (ignored): {', '.join(st['unknown'])}"] if st["unknown"] else []) \
+        + ([f"ruled on twice the same way: {', '.join(st['repeated'])}"] if st["repeated"] else [])
+    return Check("rubric_tests", WARN if notes else PASS, "quality", "; ".join(notes), details)
+
+
+def keep_rubric_rulings(rulings, drop: set[str], keep_first: bool = False) -> list[dict]:
+    """A judge's rubric rulings without those on `drop` (or, with keep_first, without their repeats)."""
+    out, seen = [], set()
+    for entry in rulings if isinstance(rulings, list) else []:
+        rec, _ = rubric_ruling(entry)
+        tid = rec["test_id"] if rec else None
+        if tid in drop and (not keep_first or tid in seen):
+            continue
+        seen.add(tid)
+        out.append(entry)
+    return out
+
+
+def validate_rubric_supplement(data: dict | None, wanted: list[str]) -> tuple[list[dict], list[str], list[str]]:
+    """(rulings, rejections, warnings) for the rubric tests a coverage supplement was asked about: one valid ruling
+    each, nothing on tests it was not asked about."""
+    raw = (data or {}).get("rubric_rulings") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return [], ["the supplement has no JSON block with 'rubric_rulings'"], []
+    asked, out, extra = set(wanted), [], set()
+    for entry in raw:
+        rec, problem = rubric_ruling(entry)
+        if rec is None or rec["test_id"] not in asked:
+            extra |= {rec["test_id"]} if rec else set()
+            continue
+        if problem:
+            return [], [f"the supplement's rubric ruling is invalid: {problem}"], []
+        out.append({**rec, "origin": "supplement"})
+    warnings = [f"the supplement also ruled on tests it was not asked about (ignored): {', '.join(sorted(extra))}"] \
+        if extra else []
+    return out, [], warnings
 
 
 def required_sections(prompt_body: str) -> list[tuple[int, str]]:

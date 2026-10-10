@@ -20,9 +20,11 @@ FAKE_SECRETS = {
 }
 
 
-def mock_override(**mock_options) -> dict:
-    """Config override for fast offline runs with the mock provider."""
+def mock_override(preset: str = "legacy_thorough", **mock_options) -> dict:
+    """Config override for fast offline runs with the mock provider. Most tests were written for the
+    legacy_thorough layout (N1-N4, R1-R3, F1-F3, J1-J3); the presets' own tests pass preset="routine" etc."""
     return {
+        "preset": preset,
         "provider": {"type": "mock", "preflight": "off", "mock": {"delay_seconds": 0.01, **mock_options}},
         "concurrency": {"max_parallel_agents": 4, "stagger_seconds": 0},
         "retry": {"max_attempts": 3, "base_delay_seconds": 0, "max_delay_seconds": 0, "jitter": 0},

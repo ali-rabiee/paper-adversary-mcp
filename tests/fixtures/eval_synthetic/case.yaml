@@ -1,0 +1,32 @@
+# SYNTHETIC case for testing the evaluation harness offline. Its "ground truth" was written to exercise the
+# scoring code, not by adjudicating a real review: it is never evidence about any preset's quality or cost.
+id: synthetic_overlap
+category: genuine_overlap
+status: synthetic
+venue: harness test
+submission: submission.md
+submission_type: paper
+evidence:
+  - identifier: "arXiv:2401.00001"
+    title: "Analysis of Guidance Weight Schedulers"
+    file: evidence/2401.00001.md
+  - identifier: "arXiv:2401.00002"
+    title: "A Different Paper About Guidance Weights"
+    file: evidence/2401.00002.md
+ground_truth:
+  adjudicated_by: null
+  adjudicated_on: null
+  serious_issues:
+    - id: GT1
+      kind: prior_work
+      severity: FATAL
+      description: "Synthetic: the scheduler paper is treated as anticipating the method."
+      prior_work: ["arXiv:2401.00001"]
+    - id: GT2
+      kind: technical
+      severity: MAJOR_FIXABLE
+      description: "Synthetic: a technical issue that only a person can match to findings."
+  not_fatal:
+    - id: NF1
+      description: "Synthetic: the second paper is similar-looking but does not anticipate the method."
+      prior_work: ["arXiv:2401.00002"]

@@ -1,0 +1,45 @@
+# milestone: routine, widened for a milestone review (e.g. before submission).
+#
+# Four novelty refuters and three rigor refuters, each with its own lens (no two share a focus), still split
+# between the two models; judges and the completeness critic at xhigh; up to six prior papers verified; up
+# to two follow-up rounds. Max effort is not enabled anywhere. Reserve it for an explicitly chosen difficult
+# technical question by setting one agent's effort in trusted configuration ($PAPER_ADVERSARY_CONFIG or
+# `paper-adversary review --trusted-config FILE`), e.g.  rigor: {per_agent: {1: {effort: max}}}
+#
+# This is a proposed allocation, not an empirically proven optimum; compare presets on your own
+# adjudicated cases (eval/README.md) before concluding that one is better or cheaper.
+
+description: Wider mixed panel for milestone reviews; xhigh judges and critic; 6 prior papers verified; 2 rounds.
+extends: routine
+
+novelty:
+  agents: 4
+  per_agent:
+    1: {model: opus-5.5, effort: high, lens: direct_overlap}
+    2: {model: fable-5.1, effort: high, lens: other_names}
+    3: {model: fable-5.1, effort: high, lens: framing_and_gap}
+    4: {model: opus-5.5, effort: high, lens: recent_and_bibliography}
+
+rigor:
+  agents: 3
+  per_agent:
+    1: {model: fable-5.1, effort: xhigh, lens: theory}
+    2: {model: opus-5.5, effort: high, lens: empirical}
+    3: {model: fable-5.1, effort: high, lens: claims_vs_evidence}
+
+judge:
+  per_agent:
+    1: {model: opus-5.5, effort: xhigh}
+    2: {model: fable-5.1, effort: xhigh}
+
+critic:
+  effort: xhigh
+
+verifier:
+  max_agents_per_batch: 6
+  max_agents_per_run: 6
+  max_papers_per_run: 6
+
+followup:
+  auto_continue: true
+  max_rounds: 2

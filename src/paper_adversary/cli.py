@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import sys
 import time
+from pathlib import Path
 
 from paper_adversary.util import load_dotenv_into_environ
 
@@ -15,15 +16,15 @@ def _split(value: str | None) -> list[str]:
 
 
 def _launch_or_run(store, stages: list[str], rerun: list[str], allow_incomplete: bool, foreground: bool,
-                   wait: float) -> int:
+                   wait: float, refresh_stale: bool = False) -> int:
     from paper_adversary import service
     from paper_adversary.worker import launch, worker_main
 
     if foreground:
-        code = worker_main(str(store.dir), stages, rerun, allow_incomplete)
+        code = worker_main(str(store.dir), stages, rerun, allow_incomplete, refresh_stale)
         print(service.status_text(store.run_id))
         return code
-    info = launch(store, stages, rerun, allow_incomplete)
+    info = launch(store, stages, rerun, allow_incomplete, refresh_stale=refresh_stale)
     print(f"Started worker pid {info['pid']} for {', '.join(stages)} (log: {store.dir / 'logs' / 'worker.log'})")
     if wait:
         from paper_adversary.util import lock_is_held
@@ -56,6 +57,7 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--stages", required=True)
     w.add_argument("--rerun", default="")
     w.add_argument("--allow-incomplete", action="store_true")
+    w.add_argument("--refresh-stale", action="store_true")
 
     def paper_args(p: argparse.ArgumentParser) -> None:
         p.add_argument("paper", help="path to a .pdf/.md/.tex/.txt file, or '-' to read text from stdin")
@@ -65,6 +67,9 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--rubric")
         p.add_argument("--config", help="config override: YAML/JSON file or inline YAML")
         p.add_argument("--type", default="auto", choices=["auto", "paper", "idea"])
+        p.add_argument("--preset", help="routine (default) | milestone | legacy_thorough (config/presets/)")
+        p.add_argument("--trusted-config", help="YAML/JSON file merged as trusted settings: may raise agent counts "
+                       "and limits or set max effort (unlike --config)")
 
     c = sub.add_parser("create", help="create a run (no agents started)")
     paper_args(c)
@@ -90,6 +95,17 @@ def main(argv: list[str] | None = None) -> int:
         if name == "resume":
             p.add_argument("--through", default="critic",
                            choices=["refuters", "judges", "synthesis", "critic", "followup"])
+    ev = sub.add_parser("eval", help="offline evaluation harness: paired preset comparisons on adjudicated cases")
+    evs = ev.add_subparsers(dest="eval_cmd", required=True)
+    e1 = evs.add_parser("validate", help="check a case directory (eval/README.md)")
+    e1.add_argument("case")
+    e2 = evs.add_parser("prepare", help="create one run per preset with identical inputs (starts nothing)")
+    e2.add_argument("case")
+    e2.add_argument("--presets", default="routine,legacy_thorough")
+    e2.add_argument("--mode", default="reasoning", choices=["reasoning", "discovery"])
+    e3 = evs.add_parser("report", help="measure a prepared pair after its runs finished")
+    e3.add_argument("pair", help="the pair directory printed by prepare")
+    e3.add_argument("--scores", help="the filled manual_scores.yaml")
     fu = sub.add_parser("followup", help="run the follow-up of the completeness critique (verify, adjudicate, "
                         "revise the memo, re-check)")
     fu.add_argument("run")
@@ -126,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:
     v = sub.add_parser("validate", help="check config, CLI and login; --probe to test each model")
     v.add_argument("--config")
     v.add_argument("--probe", action="store_true")
+    v.add_argument("--preset", help="validate this preset instead of the default")
 
     args = parser.parse_args(argv)
 
@@ -137,7 +154,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "worker":
         from paper_adversary.worker import worker_main
 
-        return worker_main(args.run_dir, _split(args.stages), _split(args.rerun), args.allow_incomplete)
+        return worker_main(args.run_dir, _split(args.stages), _split(args.rerun), args.allow_incomplete,
+                           args.refresh_stale)
 
     from paper_adversary import service
     from paper_adversary.store import RunStore
@@ -145,7 +163,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd in ("create", "review"):
         text = sys.stdin.read() if args.paper == "-" else None
         info = service.create_run(None if text else args.paper, text, args.title, args.venue, args.field,
-                                  args.rubric, args.config, args.type)
+                                  args.rubric, args.config, args.type, args.preset,
+                                  Path(args.trusted_config) if args.trusted_config else None)
         print(service.format_created(info))
         if args.cmd == "create":
             return 0
@@ -164,11 +183,34 @@ def main(argv: list[str] | None = None) -> int:
             stages = [args.cmd]
             rerun = [a for a, v in state["agents"].items() if v["role"] == args.cmd] if args.rerun else []
         else:
-            stages, rerun = service.resume_stages(state, args.through), []
+            stages, rerun = service.resume_stages(state, args.through, service.stale_agents(store, state)), []
             if not stages:
-                print("Nothing to resume: every agent through that stage is complete or quarantined.")
+                print("Nothing to resume: every agent through that stage is complete, current, or quarantined.")
                 return 0
-        return _launch_or_run(store, stages, rerun, args.allow_incomplete, args.foreground, args.wait)
+        return _launch_or_run(store, stages, rerun, args.allow_incomplete, args.foreground, args.wait,
+                              refresh_stale=args.cmd == "resume")
+    if args.cmd == "eval":
+        from paper_adversary import evaluation
+
+        if args.eval_cmd == "validate":
+            errors, warnings = evaluation.validate_case(args.case)
+            for w in warnings:
+                print(f"warning: {w}")
+            for e in errors:
+                print(f"error: {e}")
+            print("valid" if not errors else "invalid")
+            return 0 if not errors else 2
+        if args.eval_cmd == "prepare":
+            pair = evaluation.prepare(args.case, _split(args.presets), args.mode)
+            print(f"Prepared {pair['mode']} pair for case {pair['case']} ({pair['status']}): {pair['pair_dir']}")
+            for r in pair["runs"]:
+                print(f"  {r['preset']}: {r['run_id']}   start it with: paper-adversary resume {r['run_id']} "
+                      "--through followup")
+            print(f"When both finished: paper-adversary eval report {pair['pair_dir']}")
+            return 0
+        result = evaluation.report(args.pair, args.scores)
+        print(evaluation.comparison_markdown(result))
+        return 0
     if args.cmd == "status":
         print(service.status_text(args.run))
     elif args.cmd == "report":
@@ -205,7 +247,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         print(service.release_quarantine(args.run, aid, args.reason, "cli"))
     elif args.cmd == "validate":
-        print(asyncio.run(service.validate_text(args.config, args.probe)))
+        print(asyncio.run(service.validate_text(args.config, args.probe, args.preset)))
     elif args.cmd == "desktop-config":
         return _desktop_config(args.install)
     return 0

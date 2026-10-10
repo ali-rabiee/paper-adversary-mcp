@@ -9,13 +9,21 @@ every defect the completion gates check for (see `_opt`).
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import json
 import re
 import shutil
 import tempfile
 from pathlib import Path
 
-from paper_adversary.providers.base import AgentRequest, AgentResult, ErrorKind, ProviderError
+from paper_adversary.providers.base import (
+    AgentRequest,
+    AgentResult,
+    ErrorKind,
+    ProviderError,
+    hidden_turns,
+    hidden_turns_warning,
+)
 from paper_adversary.reports import SEVERITY_LABEL
 from paper_adversary.util import append_jsonl, atomic_write_text, read_json, utcnow
 
@@ -41,6 +49,8 @@ class MockProvider:
 
     delay_seconds, synthetic_usage, quote_inputs, reset_at, retry_after_s
     fail            {aid: [error kind or None per attempt]}
+    together        [aid, ...]                     these agents' injected failures wait for each other (at most
+                                                   30 s), so parallel agents fail at one moment whatever the load
     omit_json       [aid, ...]                     (same as json: omit)
     json            {aid: omit|malformed|trailing_comma|unfenced|schema_invalid|id_mismatch|quoted_snippet}
     headings        {aid: False}                   objections/judgments without ### headings
@@ -54,17 +64,32 @@ class MockProvider:
     coverage        {aid: fraction}                share of objections a judge classifies
     conflict        {aid: objection ID}            a judge classifies this ID a second time, MAJOR BUT FIXABLE
     repair          {aid: valid|invent_objection|invent_reference|change_title|fail:<kind>}
-    decisive        {aid: {category, severity, basis, prior: {title, arxiv_id, doi}, prior_passage,
-                           submission_passage}}    makes a novelty refuter's O1 a decisive prior-work objection
+    decisive        {aid: {category, severity, basis, confidence, prior: {title, arxiv_id, doi} or priors: [...],
+                           prior_passage, submission_passage, pairs: [{reference, submission_passage, ...}]}}
+                                                   makes a novelty refuter's O1 a decisive prior-work objection
+    minor_prior     {aid: {... as decisive}}       makes its O2 a prior-work objection (minor unless given)
+    rate            {judge aid: {objection ID: severity}}   a judge's severity for these objections
+    group           {judge aid: [{ids, severity, member_severity}, ...]}  one judgment for these objections
+    rubric          {judge aid: {test ID: no|skip|invalid|<severity>}}  rulings on the listed rubric tests (default no)
+    ledger          [{id, claim, location}, ...]   the intake's claims ledger (default: one mock claim)
     verdict         {aid or "default": verdict}    what verifiers answer (default anticipates_partially)
     misplace        {aid: True}                    a memo lists unverified threats as surviving criticisms
     misfile         {aid: True}                    a revised memo also leads a section-5 entry with them
     items           {aid: [item, ...]}             a critic's (critic_v2) or re-check's items (default: one MINOR)
     ruling          {aid or "default": severity}   what adjudicators rule (default MAJOR_FIXABLE)
+    updates         {adjudicator aid: {item ID: [{objection_id, severity}, ...]}}  its objection_updates
+    covered         {adjudicator aid: {item ID: {is_new, already_covered_by}}}       what it says an item repeats
     skip_item       {aid: item id}                 an adjudicator or revision leaves this item out
     references      {aid: [ref, ...]}              a novelty refuter's references (default: one well-known paper)
-    supplement      {aid: valid|skip_one|invalid|extra|fail:<kind>}   how a coverage supplement answers
+    supplement      {aid: valid|skip_one|skip_tests|invalid|extra|fail:<kind>}   how a coverage supplement answers
     placement_fix   {aid: valid|unchanged|renamed|invent|fail:<kind>} how a memo placement fix answers
+    limit           {aid, model ID or "default": {type, scope, reset_at}}  which plan limit an injected plan_limit is
+                                                   (scope "model" or "account"; default: account-wide, reset unknown)
+    rate_limit      {model ID or "default": rate_limit_info}   the plan windows a call or probe reports (Claude Code's
+                                                   rate_limit_event), e.g. a Fable call's seven_day_overage_included
+    turns           {aid: [{stop_reason, output_tokens}, ...]}  model turns before the final one (hidden turns)
+    context_window  {model ID: tokens}             what a preflight probe reports
+    probe_fail      {model ID: error kind}         a preflight probe of this model fails with this kind
     """
 
     name = "mock"
@@ -73,6 +98,7 @@ class MockProvider:
         self.options = options or {}
         self.attempts: dict[str, int] = {}
         self.repair_calls = 0
+        self._arrived: set[str] = set()  # agents of `together` whose injected failure is due
 
     def _opt(self, name: str, aid: str, attempt: int, default=None):
         value = (self.options.get(name) or {}).get(aid, default) if isinstance(self.options.get(name), dict) \
@@ -91,9 +117,34 @@ class MockProvider:
                 "subscriptionType": "mock"}
 
     async def probe(self, model: str, log_dir: Path, tools=(), tool_server: dict | None = None) -> dict:
+        kind = (self.options.get("probe_fail") or {}).get(model)
+        if kind:
+            return {"ok": False, "model_requested": model, "tools": sorted(tools), "error_kind": kind,
+                    "error": f"injected probe failure ({kind})", "checked_at": utcnow().isoformat(timespec="seconds"),
+                    "mock": True}
         return {"ok": True, "model_requested": model, "tools": sorted(tools), "served_models": [model],
-                "context_window": None, "checked_at": utcnow().isoformat(timespec="seconds"), "mock": True,
-                "substituted": []}
+                "context_window": (self.options.get("context_window") or {}).get(model),
+                "checked_at": utcnow().isoformat(timespec="seconds"), "mock": True, "substituted": [],
+                "runtime": {"mock": True, "rate_limit": self._rate_limit(model)}}
+
+    def _rate_limit(self, model: str) -> dict | None:
+        table = self.options.get("rate_limit") or {}
+        return table.get(model) or table.get("default")
+
+    def _limit_error(self, req: AgentRequest, attempt: int) -> ProviderError:
+        """An injected plan limit, as Claude Code reports one: the rejected window in rate_limit, and which limit."""
+        table = self.options.get("limit") or {}
+        spec = table.get(req.agent_id) or table.get(req.model) or table.get("default") or {}
+        reset_at = spec.get("reset_at", self.options.get("reset_at"))
+        info = self._rate_limit(req.model)
+        if spec.get("type"):
+            stamp = int(dt.datetime.fromisoformat(reset_at).timestamp()) if reset_at else None
+            info = {**(info or {}), "status": "rejected", "rateLimitType": spec["type"], "resetsAt": stamp}
+        message = (f"You've reached your {spec.get('named', 'Fable')} limit (injected, attempt {attempt})"
+                   if spec.get("scope") == "model" else f"injected plan_limit (attempt {attempt})")
+        return ProviderError(ErrorKind.PLAN_LIMIT, message, reset_at=reset_at, detail={
+            "rate_limit": info, "limit": {"type": spec.get("type"), "scope": spec.get("scope", "account"),
+                                          "model": req.model}})
 
     async def run(self, req: AgentRequest, cancel: asyncio.Event | None = None) -> AgentResult:
         attempt = self.attempts.get(req.agent_id, 0) + 1
@@ -113,7 +164,16 @@ class MockProvider:
 
         planned = (self.options.get("fail") or {}).get(aid) or []
         if attempt <= len(planned) and planned[attempt - 1]:
+            group = set(self.options.get("together") or [])
+            if aid in group:
+                self._arrived.add(aid)
+                for _ in range(3000):
+                    if group <= self._arrived:
+                        break
+                    await asyncio.sleep(0.01)
             kind = ErrorKind(planned[attempt - 1])
+            if kind is ErrorKind.PLAN_LIMIT:
+                raise self._limit_error(req, attempt)
             raise ProviderError(kind, f"injected {kind.value} (attempt {attempt})",
                                 reset_at=self.options.get("reset_at"), retry_after_s=self.options.get("retry_after_s"))
 
@@ -132,14 +192,17 @@ class MockProvider:
                            self._opt("coverage", aid, attempt), self._opt("decisive", aid, attempt),
                            self._opt("verdict", aid, attempt) or (self.options.get("verdict") or {}).get("default"),
                            bool(self._opt("misplace", aid, attempt)), self._opt("references", aid, attempt),
-                           self._opt("conflict", aid, attempt))
+                           self._opt("conflict", aid, attempt), self._opt("minor_prior", aid, attempt),
+                           self._opt("rate", aid, attempt), self.options.get("ledger"),
+                           self._opt("group", aid, attempt), self._opt("rubric", aid, attempt))
             if req.role in ("critic", "recheck") and '"items": [' in req.system_prompt and json_mode != "omit":
                 text += "\n" + _block({"summary": "mock", "items": self._opt("items", aid, attempt, DEFAULT_ITEMS),
                                         "checks_without_findings": []}, json_mode)
             elif req.role == "adjudicator":
                 text = _adjudicator(req, head_of(text), self._opt("ruling", aid, attempt) or
                                     (self.options.get("ruling") or {}).get("default") or "MAJOR_FIXABLE",
-                                    self._opt("skip_item", aid, attempt))
+                                    self._opt("skip_item", aid, attempt), self._opt("updates", aid, attempt),
+                                    self._opt("covered", aid, attempt))
             elif req.role == "revision":
                 text = _revision(req, head_of(text), bool(self._opt("misplace", aid, attempt)),
                                  bool(self._opt("misfile", aid, attempt)),
@@ -164,11 +227,20 @@ class MockProvider:
         if self.options.get("synthetic_usage"):
             usage = {"input_tokens": 1000, "output_tokens": 500, "cache_read_input_tokens": 0,
                      "cache_creation_input_tokens": 0, "server_tool_use": {"web_search_requests": 0}}
+        turns = [{"turn": i, "model": served, **t} for i, t in enumerate(
+            [*(self._opt("turns", aid, attempt) or []), {"stop_reason": stop_reason, "output_tokens": 500}], start=1)]
+        hidden = hidden_turns(turns, len(turns), usage, tool_less=not req.tools and not req.tool_server) \
+            if len(turns) > 1 else None
+        if usage and hidden:
+            usage["output_tokens"] += hidden["output_tokens"]
+        warnings = [hidden_turns_warning(hidden)] if hidden else []
         return AgentResult(text=text, stop_reason=stop_reason, usage=usage,
-                           model_usage={served: {"inputTokens": 1000, "outputTokens": 500}} if usage else None,
-                           reported_cost_usd=None, duration_ms=int(delay * 1000), num_turns=1,
-                           served_models=[served], transcript_path=transcript, sandbox_dir=sandbox,
-                           provider="mock", runtime={"mock": True})
+                           model_usage={served: {"inputTokens": 1000, "outputTokens": usage["output_tokens"]}}
+                           if usage else None,
+                           reported_cost_usd=None, duration_ms=int(delay * 1000), num_turns=len(turns),
+                           served_models=[served], warnings=warnings, transcript_path=transcript, sandbox_dir=sandbox,
+                           provider="mock", runtime={"mock": True, "rate_limit": self._rate_limit(req.model)},
+                           turns=turns if len(turns) > 1 else [], hidden_turns=hidden)
 
     def _transcript(self, path: Path, req: AgentRequest, attempt: int, text: str, served: str,
                     stop_reason: str) -> None:
@@ -200,6 +272,8 @@ class MockProvider:
         base = req.agent_id.removesuffix("-repair")
         mode = str(self._opt("repair", base, attempt) or "valid")
         if mode.startswith("fail:"):
+            if mode == "fail:plan_limit":  # as Claude Code reports one (`limit`, keyed by "<aid>-<call>" or model)
+                raise self._limit_error(req, attempt)
             raise ProviderError(ErrorKind(mode.split(":", 1)[1]), f"injected repair failure ({mode})")
         m = re.search(r"<report>\n(.*?)\n</report>", req.user_text, re.S)
         report = m.group(1) if m else ""
@@ -228,8 +302,11 @@ class MockProvider:
         base = req.agent_id.removesuffix("-supplement")
         mode = str(self._opt("supplement", base, attempt) or "valid")
         if mode.startswith("fail:"):
+            if mode == "fail:plan_limit":  # as Claude Code reports one (`limit`, keyed by "<aid>-<call>" or model)
+                raise self._limit_error(req, attempt)
             raise ProviderError(ErrorKind(mode.split(":", 1)[1]), f"injected supplement failure ({mode})")
         asked = re.findall(r"^- ([A-Z]{1,2}\d+-[OI]\d+): (?:not classified|you gave it)", req.user_text, re.M)
+        tests = [] if mode == "skip_tests" else re.findall(r"^- ([A-Z][A-Z0-9_]*): rubric test", req.user_text, re.M)
         if mode == "skip_one":
             asked = asked[1:]
         if mode == "extra":
@@ -245,11 +322,13 @@ class MockProvider:
             entries = [{"objection_ids": [i], "title": f"{i} (supplement)", "severity": "MINOR",
                         "confidence": "medium", "refuter_sources": [i.split("-")[0]], "supporting_evidence": "mock",
                         "resolvable_with_more_evidence": "yes", "what_would_resolve": "mock"} for i in asked]
-            data = {"judgments": entries, "refuter_disagreements": []}
+            data = {"judgments": entries, "refuter_disagreements": [],
+                    "rubric_rulings": [{"test_id": t, "applies": "partly", "severity": "MINOR",
+                                        "rationale": "mock supplement"} for t in tests]}
         if mode == "invalid":
             data = {"judgments": [{"objection_ids": asked[:1], "severity": "SEVERE"}]} if not base.startswith("A") \
                 else {"rulings": [{"item_ids": asked[:1], "severity": "SEVERE"}]}
-        heads = "\n".join(f"### MINOR: ruling ({i})\nMock supplement ruling.\n" for i in asked)
+        heads = "\n".join(f"### MINOR: ruling ({i})\nMock supplement ruling.\n" for i in asked + tests)
         return f"Supplement saw reports of: {', '.join(shown) or 'none'}\n\n{heads}\n" + _block(data)
 
     def _placement_fix(self, req: AgentRequest, attempt: int) -> str:
@@ -257,6 +336,8 @@ class MockProvider:
         base = req.agent_id.removesuffix("-placement_fix")
         mode = str(self._opt("placement_fix", base, attempt) or "valid")
         if mode.startswith("fail:"):
+            if mode == "fail:plan_limit":  # as Claude Code reports one (`limit`, keyed by "<aid>-<call>" or model)
+                raise self._limit_error(req, attempt)
             raise ProviderError(ErrorKind(mode.split(":", 1)[1]), f"injected placement-fix failure ({mode})")
         heads = re.findall(r"`## (\d+)\. ([^`]+)`", req.system_prompt)
         m = re.search(r"may not lead an entry of section \d+: ([^\n]+)", req.user_text)
@@ -286,9 +367,34 @@ def _block(data: dict, mode: str | None = None) -> str:
     return "```json\n" + raw + "\n```"
 
 
+def _prior_work(obj: dict, spec: dict, user_text: str, severity: str) -> None:
+    """Make a mock objection rest on prior work: its references and its verbatim overlap pairs."""
+    priors = spec.get("priors") or [spec.get("prior") or {}]
+    obj.update(category=spec.get("category", "already_done"), severity_estimate=spec.get("severity", severity),
+               evidence_basis=spec.get("basis", "full_text"),
+               references=[{"title": p.get("title"), "arxiv_id": p.get("arxiv_id"), "doi": p.get("doi"),
+                            "year": p.get("year")} for p in priors])
+    if spec.get("confidence"):
+        obj["confidence"] = spec["confidence"]
+    pairs = []
+    if spec.get("prior_passage"):
+        pairs.append({"reference": 1, "prior_passage": spec["prior_passage"], "prior_location": "p. 1",
+                      "submission_passage": spec.get("submission_passage") or _submission_words(user_text),
+                      "submission_location": "Sec. 1", "relation": "same_method"})
+    for extra in spec.get("pairs") or []:
+        pairs.append({"reference": extra.get("reference", 1), "prior_location": "p. 1", "relation": "same_method",
+                      "prior_passage": extra.get("prior_passage") or spec.get("prior_passage"),
+                      "submission_passage": extra.get("submission_passage") or _submission_words(user_text),
+                      "submission_location": extra.get("submission_location", "Sec. 1")})
+    if pairs:
+        obj["overlap_evidence"] = pairs
+
+
 def _render(req: AgentRequest, seen: list[str], json_mode: str | None, headings: bool,
             coverage: float | None, decisive: dict | None = None, verdict: str | None = None,
-            misplace: bool = False, references: list | None = None, conflict: str | None = None) -> str:
+            misplace: bool = False, references: list | None = None, conflict: str | None = None,
+            minor_prior: dict | None = None, rate: dict | None = None, ledger: list | None = None,
+            group: list | None = None, rubric: dict | None = None) -> str:
     aid = req.agent_id
     head = f"# Mock {req.role} report ({aid})\n\nCANARY_{aid}\n\nInputs seen: {', '.join(seen) or 'none'}\n"
     if req.role == "verifier":
@@ -305,17 +411,9 @@ def _render(req: AgentRequest, seen: list[str], json_mode: str | None, headings:
                      "arxiv_id": "1706.03762"}]
             objections.append(obj)
         if decisive and req.role == "novelty":
-            prior = decisive.get("prior") or {}
-            objections[0].update(category=decisive.get("category", "already_done"),
-                                 severity_estimate=decisive.get("severity", "fatal"),
-                                 evidence_basis=decisive.get("basis", "full_text"),
-                                 references=[{"title": prior.get("title"), "arxiv_id": prior.get("arxiv_id"),
-                                              "doi": prior.get("doi"), "year": prior.get("year")}])
-            if decisive.get("prior_passage"):
-                objections[0]["overlap_evidence"] = [{
-                    "reference": 1, "prior_passage": decisive["prior_passage"], "prior_location": "p. 1",
-                    "submission_passage": decisive.get("submission_passage") or _submission_words(req.user_text),
-                    "submission_location": "Sec. 1", "relation": "same_method"}]
+            _prior_work(objections[0], decisive, req.user_text, "fatal")
+        if minor_prior and req.role == "novelty":
+            _prior_work(objections[1], minor_prior, req.user_text, "minor")
         parts = []
         for o in objections:
             prose = o["argument"]
@@ -344,6 +442,17 @@ def _render(req: AgentRequest, seen: list[str], json_mode: str | None, headings:
                 judgments.append({"objection_ids": [f"{rid}-O2"], "title": f"{rid} objection 2", "severity": sev2,
                                   "confidence": "low", "refuter_sources": [rid], "supporting_evidence": "mock",
                                   "resolvable_with_more_evidence": "partially", "what_would_resolve": "mock"})
+        for j in judgments:
+            j["severity"] = (rate or {}).get(j["objection_ids"][0], j["severity"])
+        for g in group or []:  # one judgment for several objections, at the group's severity (judge_v3 style)
+            members = [j for j in judgments if j["objection_ids"][0] in g["ids"]]
+            if members:
+                at = judgments.index(members[0])
+                judgments = [j for j in judgments if j not in members]
+                judgments.insert(at, {**members[0], "objection_ids": [j["objection_ids"][0] for j in members],
+                                      "title": g.get("title", "grouped objections"),
+                                      "severity": g.get("severity", members[0]["severity"]),
+                                      "member_severity": dict(g.get("member_severity") or {})})
         if coverage is not None:
             judgments = judgments[: max(0, round(len(judgments) * coverage))]
         if conflict:
@@ -358,6 +467,18 @@ def _render(req: AgentRequest, seen: list[str], json_mode: str | None, headings:
                           else f"**{label}** {j['title']}\n") + "Mock judgment.\n")
         data = {"judgments": judgments, "refuter_disagreements": []}
         body = head + "\n## Judgments\n\n" + "\n".join(lines)
+        listed = re.search(r"<rubric_tests[^>]*>\n(.*?)</rubric_tests>", req.user_text, re.S)
+        if listed:  # judge_v3: a ruling on every listed rubric test (default: does not apply)
+            rulings = []
+            for tid in re.findall(r"^- ([A-Z][A-Z0-9_]*): ", listed.group(1), re.M):
+                how = (rubric or {}).get(tid, "no")
+                if how == "skip":
+                    continue
+                rulings.append({"test_id": tid, "applies": "no" if how == "no" else "maybe" if how == "invalid"
+                                else "yes", "severity": None if how in ("no", "invalid") else how,
+                                "rationale": "mock"})
+            data["rubric_rulings"] = rulings
+            body += "\n## Rubric tests\n\n" + "".join(f"- {r['test_id']}: applies {r['applies']}\n" for r in rulings)
         return body + ("" if json_mode == "omit" else "\n" + _block(data, json_mode))
     if req.role in ("synthesis", "critic", "recheck", "revision", "adjudicator"):
         sections = _prompt_sections(req.system_prompt) or list(enumerate(
@@ -373,10 +494,11 @@ def _render(req: AgentRequest, seen: list[str], json_mode: str | None, headings:
             out.append(f"## {n}. {title}\n\n{body}\n")
         return head + "\n" + "\n".join(out)
     if req.role == "intake":
+        claims = ledger or [{"id": "C1", "claim": "Mock claim", "location": "Abstract", "type": "empirical"}]
         data = {"title": "Mock Title", "field": "machine learning", "submission_type": "paper",
-                "venue_guess": None, "claims": [{"id": "C1", "claim": "Mock claim", "location": "Abstract",
-                                                 "type": "empirical"}]}
-        body = head + "\n## Claims\n\n- C1: Mock claim (Abstract)\n"
+                "venue_guess": None, "claims": claims}
+        body = head + "\n## Claims\n\n" + "".join(f"- {c['id']}: {c['claim']} ({c.get('location')})\n"
+                                                    for c in claims)
         return body + ("" if json_mode == "omit" else "\n" + _block(data, json_mode))
     return head
 
@@ -387,13 +509,14 @@ def _triage(user_text: str) -> list[tuple[str, str]]:
     return re.findall(r"^- (C\d+-I\d+) \[[^\]]*?route: (\w+)", m.group(1) if m else "", re.M)
 
 
-def _adjudicator(req: AgentRequest, head: str, severity: str, skip: str | None) -> str:
+def _adjudicator(req: AgentRequest, head: str, severity: str, skip: str | None, updates: dict | None = None,
+                 covered: dict | None = None) -> str:
     routed = [i for i, route in _triage(req.user_text) if route == "adjudicate" and i != skip]
     rulings = [{"item_ids": [i], "title": f"ruling on {i}", "severity": severity, "confidence": "medium",
-                "is_new": "yes", "already_covered_by": [], "objection_updates": [], "evidence_status": "not_applicable",
-                "supporting_evidence": "mock", "rationale": "mock", "resolvable_with_more_evidence": "yes",
-                "what_would_resolve": {"kind": "analysis", "description": "mock"}, "dimension": "soundness"}
-               for i in routed]
+                "is_new": "yes", "already_covered_by": [], "objection_updates": list((updates or {}).get(i) or []),
+                "evidence_status": "not_applicable", "supporting_evidence": "mock", "rationale": "mock",
+                "resolvable_with_more_evidence": "yes", "what_would_resolve": {"kind": "analysis", "description": "mock"},
+                "dimension": "soundness", **((covered or {}).get(i) or {})} for i in routed]
     body = "".join(f"### {SEVERITY_LABEL[severity]}: ruling on {i} ({i})\nMock.\n\n" for i in routed)
     return head + "\n## Rulings\n\n" + body + _block({"overall": "mock", "rulings": rulings})
 

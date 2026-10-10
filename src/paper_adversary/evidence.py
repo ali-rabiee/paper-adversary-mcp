@@ -1,18 +1,20 @@
 """Quote checks for novelty objections: are the refuter's passages really in the prior paper and the submission?
 
-For every decisive prior-work objection (reports.is_decisive), each overlap_evidence pair is matched
-deterministically (passages.py): the prior passage against the prior paper's full text, the submission passage
-against the submission. Full texts come from the run's prior/ snapshot, fetched now if the refuter did not read
-them through its tools. The result per objection is one of quotes_verified, quotes_approximate, quotes_not_found,
-no_evidence, fulltext_unavailable, prior_not_found or not_required, stored in novelty/<agent>.evidence.json and
-shown to judges next to the reference check.
+For every decisive prior-work objection (reports.is_decisive), and for every other prior-work objection that
+gives overlap_evidence (a judge may rate it more severely than its refuter did), each overlap_evidence pair is
+matched deterministically (passages.py): the prior passage against the prior paper's full text, the submission
+passage against the submission. Full texts come from the run's prior/ snapshot, fetched now if the refuter did
+not read them through its tools. The result per objection is one of quotes_verified, quotes_approximate,
+quotes_not_found, no_evidence, fulltext_unavailable, prior_not_found or not_required (a non-decisive objection
+without pairs), stored in novelty/<agent>.evidence.json and shown to judges next to the reference check. The
+`decisive` flag (the refuter's own severity) only sets the blind verifiers' priority.
 """
 
 from __future__ import annotations
 
 from paper_adversary.isolation import _shingles
 from paper_adversary.passages import SourceText, match_passage
-from paper_adversary.reports import is_decisive, refuter_objections
+from paper_adversary.reports import is_decisive, is_prior_work_objection, refuter_objections
 from paper_adversary.search.fulltext import FullTextResult, FullTextStore, title_similarity
 from paper_adversary.util import read_json, utcnow_iso
 
@@ -79,7 +81,8 @@ async def check_agent_evidence(store, cfg, aid: str, data: dict | None, fetch: F
                        "severity_estimate": obj.get("severity_estimate"), "decisive": is_decisive(obj),
                        "evidence_basis": obj.get("evidence_basis"), "references": [], "pairs": []}
         record["objections"][obj["id"]] = entry
-        if not entry["decisive"]:
+        pairs = [p for p in obj.get("overlap_evidence") or [] if isinstance(p, dict)]
+        if not entry["decisive"] and not (pairs and is_prior_work_objection(obj)):
             entry["status"] = "not_required"
             continue
         texts: dict[int, FullTextResult] = {}
@@ -180,10 +183,12 @@ STATUS_TEXT = {
 
 
 def evidence_markdown(record: dict) -> str:
-    """What judges see: one line per decisive objection, deterministic and terse."""
-    items = [(oid, e) for oid, e in record.get("objections", {}).items() if e.get("decisive")]
+    """What judges see: one line per checked objection (decisive ones, and others that quoted prior work),
+    deterministic and terse."""
+    items = [(oid, e) for oid, e in record.get("objections", {}).items()
+             if e.get("decisive") or e.get("status") not in (None, "not_required")]
     if not items:
-        return f"Evidence check for {record.get('agent_id')}: no decisive prior-work objections to check."
+        return f"Evidence check for {record.get('agent_id')}: no prior-work objections with quotes to check."
     lines = [f"Evidence check for {record.get('agent_id')} (orchestrator; quotes matched against the full texts it "
              "retrieved, deterministic):"]
     for oid, e in items:
@@ -193,7 +198,8 @@ def evidence_markdown(record: dict) -> str:
                          + (f", {r['source']} {r.get('version') or ''}".rstrip() if r.get("source") else "")
                          for r in e.get("references") or [])
         basis = f", refuter's basis: {e['evidence_basis']}" if e.get("evidence_basis") else ""
-        lines.append(f"- {oid} [{e.get('category')}, {e.get('severity_estimate')}]: "
+        rank = "" if e.get("decisive") else "; below major, checked because it quotes prior work"
+        lines.append(f"- {oid} [{e.get('category')}, {e.get('severity_estimate')}{rank}]: "
                      f"{STATUS_TEXT.get(e['status'], e['status'])}{basis}. {refs}")
         for p in e.get("pairs") or []:
             pp, sp = p.get("prior_passage") or {}, p.get("submission_passage") or {}

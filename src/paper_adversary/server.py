@@ -27,7 +27,9 @@ Adversarial pre-submission review of a research paper or research idea.
 Pipeline: independent refuters (novelty, rigor, fit/feasibility) -> independent judges ->
 synthesis memo -> completeness critic. Refuters never see each other's reports and judges
 never see each other's; this is enforced in code. Agents run as headless Claude Code
-processes on the user's Claude plan.
+processes on the user's Claude plan. Who reviews comes from a preset: "routine" (default, a mixed
+Opus/Fable panel), "milestone" (wider, for milestone reviews), "legacy_thorough" (the old, most
+expensive setup). Use a non-default preset only when the user asks for it.
 
 Long steps (run_* tools) start a background worker and return right away. Follow progress with
 get_run_status(run_id, wait_seconds=50). A full review takes tens of minutes. Read outputs one at a
@@ -120,7 +122,8 @@ def _stale_warning(store: RunStore, rerun: list[str]) -> str:
 async def create_review_run(paper_path: str | None = None, paper_text: str | None = None, title: str | None = None,
                             venue: str | None = None, field: str | None = None, rubric: str | None = None,
                             config_override: dict[str, Any] | str | None = None,
-                            submission_type: Literal["auto", "paper", "idea"] = "auto") -> str:
+                            submission_type: Literal["auto", "paper", "idea"] = "auto",
+                            preset: str | None = None) -> str:
     """Create a review run for a paper (PDF, Markdown, LaTeX .tex, or text file) or a pasted research idea.
 
     Ingests the submission (section-aware text extraction), records metadata, and plans the agents
@@ -134,12 +137,15 @@ async def create_review_run(paper_path: str | None = None, paper_text: str | Non
         venue: Target venue, e.g. "ICML 2027".
         field: Research field, e.g. "robot learning".
         rubric: Rubric name from prompts/rubrics/, a path to a rubric file, or the rubric text.
-        config_override: Partial config (object, or YAML/JSON text, or a path) merged over config/default.yaml,
-            e.g. {"novelty": {"agents": 2}, "rigor": {"effort": "high"}}.
+        config_override: Partial config (object, or YAML/JSON text, or a path) merged over the preset, e.g.
+            {"novelty": {"agents": 1}, "judge": {"per_agent": {"2": {"model": "opus-5.5"}}}}. It may lower agent
+            counts and limits but never raise them or set max effort (that needs the user's trusted settings).
         submission_type: "paper", "idea", or "auto" (detect).
+        preset: "routine" (the default: mixed Opus/Fable panel), "milestone" (wider panel for milestone reviews)
+            or "legacy_thorough" (the previous, most expensive configuration). Pick one only when the user asks.
     """
     info = await asyncio.to_thread(service.create_run, paper_path, paper_text, title, venue, field, rubric,
-                                   config_override, submission_type)
+                                   config_override, submission_type, preset)
     return service.format_created(info) + "\n\nNext: run_refuters(run_id) or run_full_review for the whole pipeline."
 
 
@@ -248,7 +254,7 @@ async def run_full_review(paper_path: str | None = None, paper_text: str | None 
                           venue: str | None = None, field: str | None = None, rubric: str | None = None,
                           config: dict[str, Any] | str | None = None,
                           submission_type: Literal["auto", "paper", "idea"] = "auto", wait_seconds: int = 0,
-                          ctx: Context = None) -> str:
+                          preset: str | None = None, ctx: Context = None) -> str:
     """Create a run and execute the whole pipeline in one background worker:
     intake + novelty/rigor/fit refuters -> blind verifiers -> judges -> synthesis -> completeness critic ->
     follow-up rounds (when the critic raises serious items and the config's followup.auto_start is on).
@@ -257,10 +263,10 @@ async def run_full_review(paper_path: str | None = None, paper_text: str | None 
     Poll get_run_status(run_id, wait_seconds=50) until it completes; if interrupted, resume_run continues
     from where it stopped without redoing finished agents.
 
-    Args: same as create_review_run (config = config override), plus wait_seconds (max 600).
+    Args: same as create_review_run (config = config override, preset), plus wait_seconds (max 600).
     """
     info = await asyncio.to_thread(service.create_run, paper_path, paper_text, title, venue, field, rubric, config,
-                                   submission_type)
+                                   submission_type, preset)
     store = RunStore.open(info["run_id"])
     stages = service.full_review_stages(store, info)
     started = await _start(store, stages, None, False, wait_seconds, ctx)
@@ -284,13 +290,18 @@ async def resume_run(run_id: str, through: Literal["refuters", "judges", "synthe
         wait_seconds: Block up to this many seconds (max 600), then return the status.
     """
     store = RunStore.open(run_id)
-    stages = service.resume_stages(store.load_state(), through)
+    state = store.load_state()
+    stale = service.stale_agents(store, state)
+    stages = service.resume_stages(state, through, stale)
     if not stages:
-        return ("Nothing to resume: every agent through that stage is complete or quarantined.\n\n"
+        return ("Nothing to resume: every agent through that stage is complete, current, or quarantined.\n\n"
                 + service.status_text(run_id))
-    if stages == ["followup"]:
-        info = await asyncio.to_thread(launch, store, stages, None, allow_incomplete)
-        return f"Started worker (pid {info['pid']}) for the follow-up round.\n\n" + await _follow(store, wait_seconds, ctx)
+    note = (f"Inputs changed since {', '.join(sorted(stale))} ran: they and the stages after them are rerun."
+            if stale else "")
+    if stages == ["followup"] or stale:
+        info = await asyncio.to_thread(launch, store, stages, None, allow_incomplete, 8.0, True)
+        return (f"Started worker (pid {info['pid']}) for: {', '.join(stages)}. {note}".rstrip() + "\n\n"
+                + await _follow(store, wait_seconds, ctx))
     return await _start(store, stages, None, allow_incomplete, wait_seconds, ctx)
 
 
@@ -438,11 +449,13 @@ async def cancel_run(run_id: str) -> str:
 
 @mcp.tool()
 @_tool_errors
-async def validate_config(config_override: dict[str, Any] | str | None = None, probe_models: bool = False) -> str:
-    """Check the pipeline configuration: model aliases resolve, effort levels are supported, prompts exist,
-    the Claude Code CLI is installed and logged in, and no API key would be billed. With probe_models=true,
-    also sends one tiny low-effort request per distinct model to confirm your plan can use it."""
-    return await service.validate_text(config_override, probe_models)
+async def validate_config(config_override: dict[str, Any] | str | None = None, probe_models: bool = False,
+                          preset: str | None = None) -> str:
+    """Check the pipeline configuration (the default preset, or `preset`): model aliases resolve, effort levels
+    are supported, prompts exist, the Claude Code CLI is installed and logged in, and no API key would be billed.
+    With probe_models=true, also sends one tiny low-effort request per distinct model to confirm your plan can
+    use it."""
+    return await service.validate_text(config_override, probe_models, preset)
 
 
 def main() -> None:

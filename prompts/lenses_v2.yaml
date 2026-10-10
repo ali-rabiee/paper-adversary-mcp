@@ -1,0 +1,103 @@
+# Lens set v2: the v1 lenses unchanged, plus merged lenses for smaller panels.
+#
+# A preset assigns lenses to agents explicitly (per_agent: {n: {lens: <id>}}), so each agent of a role
+# covers different ground. Without explicit assignments, agent k gets lens (k-1) mod len(list), so the
+# merged lenses come first: a two-agent novelty or rigor panel splits the role between them, and a
+# one-agent fit panel covers all of fit. Larger panels should assign the specific lenses explicitly
+# (the milestone preset does), so no two agents share a focus.
+
+novelty:
+- id: direct_and_recent
+  title: Direct and recent competitors
+  focus: Find the papers that come closest to the core technical contribution in the same subfield, with emphasis
+    on the last five years and the main venues, including preprints and workshop papers from about the last 18 months;
+    establish the exact delta between each of them and the submission, follow the papers that cite the closest prior
+    work, and audit the bibliography for conspicuous omissions.
+- id: equivalents_and_gaps
+  title: Equivalent ideas, adjacent fields and gap claims
+  focus: 'Look for the same method, objective or result in adjacent fields and older literature (statistics, control,
+    optimization, operations research, signal processing, and machine learning before 2015) under different terminology,
+    translating the paper''s key terms into those vocabularies. Test the framing: every "first" and "no prior work"
+    statement, and whether the claimed gap exists; look for surveys, benchmarks and position papers that already
+    frame the problem this way.'
+- id: direct_overlap
+  title: Closest direct prior work
+  focus: 'Find the papers that come closest to the core technical contribution in the same subfield, with emphasis
+    on the last five years and the main venues, and establish the exact delta between each of them and the submission.
+
+    '
+- id: other_names
+  title: The same idea under other names
+  focus: 'Look for the same method, objective or result in adjacent fields and older literature (statistics, control,
+    optimization, operations research, signal processing, and machine learning before 2015) under different terminology.
+    Translate the paper''s key terms into those vocabularies and search for them.
+
+    '
+- id: framing_and_gap
+  title: Framing and research-gap claims
+  focus: 'Test the framing: the problem statement, every "first" and "no prior work" statement, and whether the
+    claimed gap exists. Look for surveys, benchmark papers and position papers that already frame the problem this
+    way.
+
+    '
+- id: recent_and_bibliography
+  title: Concurrent work and a bibliography audit
+  focus: 'Search preprints and workshop papers from about the last 18 months for concurrent or overlapping work,
+    follow the papers that cite the closest prior work, and audit the bibliography for conspicuous omissions.
+
+    '
+rigor:
+- id: theory
+  title: Mathematics and theory
+  focus: 'Definitions, theorem statements, proofs and derivations: hidden or invalid assumptions, gaps and errors,
+    identifiability, whether bounds are meaningful in the regimes actually used, and concrete counterexamples.
+
+    '
+- id: empirical_and_claims
+  title: Empirical methodology and claim-evidence consistency
+  focus: 'Experimental validity (data leakage, benchmark contamination, missing or incorrect controls, tuning on
+    test data, seeds and variance, statistical testing, the ablations needed to attribute the gains), and whether
+    the results establish each headline claim: unsupported causal claims, generalization beyond the tested settings,
+    selective reporting, and alternative explanations.'
+- id: empirical
+  title: Empirical methodology
+  focus: 'Experimental validity: data leakage, benchmark contamination, missing or incorrect controls, tuning on
+    test data, seeds and variance, statistical testing and multiple comparisons, and the ablations needed to attribute
+    the gains.
+
+    '
+- id: claims_vs_evidence
+  title: Do the results establish the claims?
+  focus: 'Map each headline claim to the evidence offered and ask whether it establishes it: unsupported causal
+    claims, generalization beyond the tested settings, selective reporting and failure cases, and alternative explanations
+    of the results.
+
+    '
+fit:
+- id: fit_overall
+  title: Do the experiments test the claims, and is it feasible?
+  focus: For each claim, find the experiment offered for it and judge whether it really tests it, whether the benchmarks
+    suit the claims and the baselines had a fair chance; estimate compute and cost from what the paper reports (show
+    the arithmetic, label estimates); and judge reproducibility and deployment realism (details, hyperparameters,
+    seeds, code and data, latency and hardware assumptions).
+- id: claim_tests
+  title: Do the experiments test the claims?
+  focus: 'For each claim, find the experiment offered for it and judge whether it really tests it; check whether
+    the benchmarks suit the claims and whether baselines were given a fair chance (tuning budget, data, compute,
+    reproduced versus copied numbers).
+
+    '
+- id: compute_and_cost
+  title: Compute, cost and feasibility
+  focus: 'Estimate training and inference cost from what the paper reports (show the arithmetic and label the estimates),
+    find hidden infrastructure and data costs, and judge whether the method is practical at the scale and in the
+    settings claimed.
+
+    '
+- id: reproducibility_and_deployment
+  title: Reproducibility and deployment realism
+  focus: 'Could an independent group reproduce the results from the paper (details, hyperparameters, seeds, code
+    and data availability)? Are the engineering and deployment assumptions realistic (latency, hardware, test-time
+    access, distribution shift)?
+
+    '

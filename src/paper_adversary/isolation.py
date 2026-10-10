@@ -32,11 +32,12 @@ from paper_adversary.util import atomic_write_json, read_json, read_jsonl, sha25
 
 # kind -> which roles may read it. "paper", "rubric" and "prior_text" (third-party full texts) are inputs, not
 # agent outputs; "evidence" (quote checks) and "vtask" (a verifier's passages) are computed by the orchestrator.
+# Refuters may read the rubric (the user's acceptance criteria); only prompts with front matter `rubric: true` get it.
 ROLE_VISIBILITY: dict[str, frozenset[str]] = {
     "intake": frozenset({"paper"}),
-    "novelty": frozenset({"paper"}),
-    "rigor": frozenset({"paper"}),
-    "fit": frozenset({"paper"}),
+    "novelty": frozenset({"paper", "rubric"}),
+    "rigor": frozenset({"paper", "rubric"}),
+    "fit": frozenset({"paper", "rubric"}),
     "verifier": frozenset({"paper", "prior_text", "vtask"}),
     "judge": frozenset({"paper", "rubric", "novelty", "rigor", "fit", "refcheck", "evidence", "verification",
                         "prior_text"}),
@@ -173,22 +174,25 @@ class ArtifactAccess:
                    hash_mode: str = "text") -> None:
         """hash_mode says how sha256 was computed: 'text' (whole file), 'body' (report minus front matter), 'file' (bytes)."""
         self._require(kind)
-        self.manifest.append({"kind": kind, "agent_id": agent_id, "path": self.store.rel(path) if path else None,
-                              "sha256": sha256, "hash_mode": hash_mode})
+        entry = {"kind": kind, "agent_id": agent_id, "path": self.store.rel(path) if path else None,
+                 "sha256": sha256, "hash_mode": hash_mode}
+        if entry not in self.manifest:  # an input read twice is still one input
+            self.manifest.append(entry)
 
     def allow_text(self, text: str) -> None:
         """Register a rendering derived from artifacts already read through this accessor."""
         self.texts.append(text)
 
-    def reports(self, kind: str, state: dict) -> list[ReportRecord]:
-        """Completed reports of one kind, in agent order."""
+    def reports(self, kind: str, state: dict, ids: set[str] | None = None) -> list[ReportRecord]:
+        """Completed reports of one kind, in agent order (only these agents' with `ids`, so a report the prompt
+        does not show is neither read nor listed in the manifest)."""
         from paper_adversary.reports import read_report
 
         self._require(kind)
         role = KIND_ROLE.get(kind, kind)
         out = []
         for aid, a in sorted(state.get("agents", {}).items(), key=lambda kv: _agent_sort_key(kv[0])):
-            if a.get("role") != role or a.get("status") != "complete":
+            if a.get("role") != role or a.get("status") != "complete" or (ids is not None and aid not in ids):
                 continue
             if aid == self.agent_id:
                 continue

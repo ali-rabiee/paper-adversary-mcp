@@ -9,7 +9,14 @@ from conftest import FAKE_SECRETS, mock_override
 from paper_adversary import service
 from paper_adversary.config import AgentSpec
 from paper_adversary.context import ContextBuilder
-from paper_adversary.isolation import ROLE_VISIBILITY, ArtifactAccess, IsolationGuard, IsolationViolation, find_secrets
+from paper_adversary.isolation import (
+    ROLE_VISIBILITY,
+    ArtifactAccess,
+    IsolationGuard,
+    IsolationViolation,
+    find_secrets,
+    position,
+)
 from paper_adversary.pipeline import Pipeline
 from paper_adversary.reports import read_report
 from paper_adversary.store import RunStore
@@ -24,8 +31,9 @@ def finished_run(runs_dir, sample_paper):
 
 
 def test_policy_table_matches_the_spec():
-    for role in ("novelty", "rigor", "fit"):
-        assert ROLE_VISIBILITY[role] == {"paper"}
+    for role in ("novelty", "rigor", "fit"):  # the rubric is the user's input, not an agent output (F22)
+        assert ROLE_VISIBILITY[role] == {"paper", "rubric"}
+    assert ROLE_VISIBILITY["intake"] == {"paper"}
     assert {"novelty", "rigor", "fit", "rubric"} <= ROLE_VISIBILITY["judge"]
     assert "judge" not in ROLE_VISIBILITY["judge"]
     assert {"judge", "novelty"} <= ROLE_VISIBILITY["synthesis"] and "critic" not in ROLE_VISIBILITY["synthesis"]
@@ -77,6 +85,56 @@ def test_built_contexts_contain_only_allowed_inputs(finished_run):
     assert {m["kind"] for m in jctx.manifest} == {"paper", "novelty", "rigor", "fit", "rubric", "evidence",
                                                   "verification"}
     assert "CANARY_J1" not in jctx.user_text and "CANARY_N1" in jctx.user_text
+
+
+def test_refuter_prompts_that_calibrate_against_the_rubric_get_it(finished_run):
+    """K1 pilot (F22): the rubric's FATAL tests never reached the refuters, so none raised them. novelty_v3, rigor_v2
+    and fit_v2 (front matter rubric: true) get the run's rubric; earlier versions still see only the paper. The
+    rubric is a user input, so the guard accepts it, and the tool sentence (F28) matches what each agent has."""
+    from paper_adversary.context import ID_NOTE
+
+    state = finished_run.load_state()
+    builder = ContextBuilder(finished_run, finished_run.load_config(), __import__(
+        "paper_adversary.registry", fromlist=["ModelRegistry"]).ModelRegistry.load())
+    guard = IsolationGuard(finished_run)
+    tools = {"novelty": ["web_search", "web_fetch", "literature", "prior_text"], "rigor": [], "fit": []}
+    for role, prompt, old in (("novelty", "novelty_v3", "novelty_v2"), ("rigor", "rigor_v2", "rigor_v1"),
+                              ("fit", "fit_v2", "fit_v1")):
+        spec = AgentSpec(agent_id=f"{role[0].upper()}9", role=role, index=9, model_alias="opus-5.5",
+                         model_id="claude-opus-5-5", effort="high", prompt_name=prompt, tools=tools[role])
+        ctx = builder.build(spec, state)
+        assert {m["kind"] for m in ctx.manifest} == {"paper", "rubric"} and ctx.rubric_label
+        assert "<rubric source=" in ctx.user_text and "<refuter_reports>" not in ctx.user_text
+        assert ID_NOTE in ctx.user_text and "CANARY_" not in ctx.user_text
+        guard.check_prompt(role, spec.agent_id, ctx.system_prompt + ctx.user_text, ctx.allowed_text,
+                           position(role))
+        assert "{{" not in ctx.system_prompt and "paper.pdf" not in ctx.system_prompt
+        assert ("You have no tools" in ctx.system_prompt) == (role != "novelty")
+        before = builder.build(AgentSpec(**{**spec.__dict__, "prompt_name": old}), state)
+        assert {m["kind"] for m in before.manifest} == {"paper"} and "<rubric" not in before.user_text
+
+
+def test_every_prompt_says_what_agent_ids_name(finished_run):
+    """K1 pilot (F19): the submission's own A1, R1 and F1 were also an adjudicator's, the rigor refuter's and the fit
+    refuter's IDs. Every role's prompt says which is which; a report quoting that sentence is not a leak."""
+    from paper_adversary.context import ID_NOTE
+    from paper_adversary.isolation import _shingles
+    from paper_adversary.registry import ModelRegistry
+    from paper_adversary.util import atomic_write_json
+
+    for aid in ("INTAKE", "N1", "R1", "F1", "J1", "S1", "C1"):
+        assert ID_NOTE in (finished_run.agent_log_dir(aid) / "attempt-1" / "user_prompt.md").read_text(), aid
+    guard = IsolationGuard(finished_run)
+    data = guard._load()
+    data["N2"]["shingles"] = _shingles(ID_NOTE)[:6]  # as if N2's report had quoted the sentence
+    atomic_write_json(guard.path, data)
+    spec = AgentSpec(agent_id="R9", role="rigor", index=9, model_alias="fable-5.1", model_id="claude-fable-5-1",
+                     effort="max", prompt_name="rigor_v2")
+    ctx = ContextBuilder(finished_run, finished_run.load_config(), ModelRegistry.load()).build(
+        spec, finished_run.load_state())
+    guard.check_prompt("rigor", "R9", ctx.user_text, ctx.allowed_text, position("rigor"))
+    with pytest.raises(IsolationViolation, match="N2"):
+        guard.check_prompt("rigor", "R9", ctx.user_text, "", position("rigor"))
 
 
 def _transcript(path, *events, init=True, result=True, denials=()):

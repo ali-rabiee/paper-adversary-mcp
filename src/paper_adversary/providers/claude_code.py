@@ -27,7 +27,15 @@ from collections import deque
 from pathlib import Path
 
 from paper_adversary.config import ProviderConfig
-from paper_adversary.providers.base import AgentRequest, AgentResult, ErrorKind, ProviderError
+from paper_adversary.providers.base import (
+    MODEL_WINDOWS,
+    AgentRequest,
+    AgentResult,
+    ErrorKind,
+    ProviderError,
+    hidden_turns,
+    hidden_turns_warning,
+)
 from paper_adversary.registry import normalize_model_id, substituted_models
 from paper_adversary.util import append_jsonl, atomic_write_json, atomic_write_text, read_jsonl, utcnow
 
@@ -354,6 +362,7 @@ class _StreamState:
         self.warnings: list[str] = []
         self.abort: ProviderError | None = None
         self.rate_limit: dict | None = None  # latest plan-usage snapshot (rate_limit_event.rate_limit_info)
+        self.turns: list[dict] = []  # one per model turn (message_start .. message_delta stream events)
 
     def log(self, entry: dict) -> None:
         append_jsonl(self.transcript, {"at": utcnow().isoformat(timespec="seconds"), **entry})
@@ -371,7 +380,8 @@ class _StreamState:
             self.log({"kind": "unparsed", "line": line[:2000]})
             return
         etype = ev.get("type")
-        if etype == "stream_event":
+        if etype == "stream_event":  # partial-message deltas are dropped; each turn's stop reason is kept
+            self._on_stream(ev.get("event") or {})
             return
         if etype == "system" and ev.get("subtype") == "init":
             self._on_init(ev)
@@ -424,6 +434,24 @@ class _StreamState:
                                            f"literature tool server did not start (status: {status})")
             elif status != "connected":
                 self.warnings.append(f"literature tool server status at start: {status}")
+
+    def _on_stream(self, event: dict) -> None:
+        """Per-turn facts the final result does not carry: the stop reason and output tokens of every model turn,
+        so a turn that hit the output cap before the final one is visible (the result keeps only the final text)."""
+        etype = event.get("type") if isinstance(event, dict) else None
+        if etype == "message_start":
+            msg = event.get("message") or {}
+            self.turns.append({"turn": len(self.turns) + 1, "model": msg.get("model"), "stop_reason": None,
+                               "output_tokens": (msg.get("usage") or {}).get("output_tokens")})
+        elif etype == "message_delta":
+            if not self.turns:
+                self.turns.append({"turn": 1, "model": None, "stop_reason": None, "output_tokens": None})
+            turn = self.turns[-1]
+            turn["stop_reason"] = (event.get("delta") or {}).get("stop_reason") or turn["stop_reason"]
+            tokens = (event.get("usage") or {}).get("output_tokens")
+            if isinstance(tokens, (int, float)):
+                turn["output_tokens"] = int(tokens)
+            self.log({"kind": "turn", **turn})
 
     def _on_assistant(self, ev: dict) -> None:
         msg = ev.get("message") or {}
@@ -488,6 +516,13 @@ class _StreamState:
             reset_at = self.limit_reset()
         return kind, reset_at
 
+    def _limit_detail(self, kind: ErrorKind, texts: list[str]) -> dict:
+        """The error's detail; for a plan limit, which limit it is (plan_limit_info)."""
+        detail: dict = {"rate_limit": self.rate_limit}
+        if kind is ErrorKind.PLAN_LIMIT:
+            detail["limit"] = plan_limit_info(texts, self.rate_limit, self.req.model)
+        return detail
+
     def finish(self, exit_code: int | None, stderr_text: str, sandbox: Path) -> AgentResult:
         res = self.result
         if "unrecognized_model" in stderr_text:
@@ -500,7 +535,8 @@ class _StreamState:
             kind, reset_at = self._with_plan_window(kind, reset_at)
             raise ProviderError(kind, f"claude exited (code {exit_code}) without a result"
                                 + (f": {stderr_text[-600:]}" if stderr_text else ""),
-                                reset_at=reset_at, retry_after_s=retry_after, detail={"rate_limit": self.rate_limit})
+                                reset_at=reset_at, retry_after_s=retry_after,
+                                detail=self._limit_detail(kind, self.error_texts + [stderr_text]))
         text = (res.get("result") or "").strip() if isinstance(res.get("result"), str) else ""
         errors = [e if isinstance(e, str) else json.dumps(e) for e in (res.get("errors") or [])]
         if res.get("is_error") or res.get("subtype", "success") != "success":
@@ -514,7 +550,8 @@ class _StreamState:
             raise ProviderError(kind, text or "; ".join(errors + self.error_texts) or f"claude reported an error "
                                 f"({res.get('terminal_reason')})", reset_at=reset_at, retry_after_s=retry_after,
                                 usage=res.get("usage"), detail={"terminal_reason": res.get("terminal_reason"),
-                                                                "rate_limit": self.rate_limit})
+                                                                **self._limit_detail(kind, [text, *errors]
+                                                                                     + self.error_texts)})
         if res.get("stop_reason") == "refusal":
             raise ProviderError(ErrorKind.REFUSAL, text or "the model declined the request", usage=res.get("usage"))
         if not text:
@@ -527,6 +564,11 @@ class _StreamState:
                                  f"{', '.join(substituted)}")
         if res.get("stop_reason") == "max_tokens":
             self.warnings.append("the final message stopped at the output-token limit; the report may be cut off")
+        # an agent that called tools (even ones the sandbox refused) takes turns for them; one without any does not
+        hidden = hidden_turns(self.turns, res.get("num_turns"), res.get("usage"),
+                              tool_less=not self.req.tools and not self.req.tool_server and not self.tool_calls)
+        if hidden:
+            self.warnings.append(hidden_turns_warning(hidden))
         if res.get("permission_denials"):
             self.warnings.append(f"{len(res['permission_denials'])} tool call(s) were denied by the sandbox")
         init = self.init or {}
@@ -549,6 +591,8 @@ class _StreamState:
             runtime={"claude_code_version": init.get("claude_code_version"),
                      "apiKeySource": init.get("apiKeySource"), "tools": init.get("tools"),
                      "mcp_servers": init.get("mcp_servers"), "rate_limit": self.rate_limit},
+            turns=self.turns,
+            hidden_turns=hidden,
         )
 
 
@@ -583,6 +627,24 @@ _CODE_MAP = {
     "invalid_request": ErrorKind.INVALID_REQUEST,
     "overloaded": ErrorKind.OVERLOADED,
 }
+
+
+# "You've reached your Fable limit": a limit on one model, named in the message (generic wordings excluded).
+_MODEL_LIMIT = re.compile(r"(?:reached|hit) your ([A-Z][A-Za-z]+(?: \d+(?:\.\d+)?)?) limit")
+_NOT_A_MODEL = {"usage", "weekly", "session", "daily", "monthly", "plan", "rate", "spending", "credit", "extra"}
+
+
+def plan_limit_info(texts: list[str], rate_limit: dict | None, model: str) -> dict:
+    """Which plan limit refused a call: {"type", "scope", "model"}. The scope is "model" when the rejected window
+    limits one model (MODEL_WINDOWS: seven_day_overage_included) or the message names a model ("You've reached
+    your Fable limit"): then only that model's calls are refused. Otherwise it is "account" (5-hour, weekly).
+    The type is the rejected window's rateLimitType, else the model's limit as the message names it."""
+    info = rate_limit or {}
+    window = info.get("rateLimitType") if info.get("status") == "rejected" else None
+    m = _MODEL_LIMIT.search("\n".join(t for t in texts if t))
+    named = m.group(1) if m and m.group(1).split()[0].lower() not in _NOT_A_MODEL else None
+    scope = "model" if window in MODEL_WINDOWS or named else "account"
+    return {"type": window or (f"{named} limit" if named else None), "scope": scope, "model": model}
 
 
 def classify_error(texts: list[str], codes: list[str], api_status: int | None,

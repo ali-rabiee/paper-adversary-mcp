@@ -28,8 +28,11 @@ HIT_CHARS = 600
 
 def build_server(run_dir: Path, agent_id: str, log_file: Path, literature: bool, sections: bool,
                  search_opts: dict, attempt: int | None = None, prior_text: str | None = None,
-                 prior_scope: list[str] | None = None, fulltext_opts: dict | None = None) -> MCPServer:
-    """prior_text: None, "open" (fetch any paper; refuters) or "scoped" (only `prior_scope` keys, offline)."""
+                 prior_scope: list[str] | None = None, fulltext_opts: dict | None = None,
+                 passages: dict | None = None) -> MCPServer:
+    """prior_text: None, "open" (fetch any paper; refuters) or "scoped" (only `prior_scope` keys, offline).
+    passages: a verifier's passages under examination ({"passages": [{pid, text}], "max_words", ...}), so
+    check_quote can say whether a submission quote lies inside them."""
     instructions = ("Tools for one reviewer in an adversarial pre-submission review. "
                     + ("Use search_literature, lookup_paper and find_citing_papers to find and verify prior work. "
                        if literature else "")
@@ -152,12 +155,13 @@ def build_server(run_dir: Path, agent_id: str, log_file: Path, literature: bool,
             return f"Section {sec['id']} — {sec['title']} (part {part} of {parts})\n\n{chunk}{more}"
 
     if prior_text:
-        _add_prior_tools(mcp, run_dir, log, prior_text, set(prior_scope or []), search_opts, fulltext_opts or {})
+        _add_prior_tools(mcp, run_dir, log, prior_text, set(prior_scope or []), search_opts, fulltext_opts or {},
+                         passages)
     return mcp
 
 
 def _add_prior_tools(mcp: MCPServer, run_dir: Path, log, mode: str, scope: set[str], search_opts: dict,
-                     fulltext_opts: dict) -> None:
+                     fulltext_opts: dict, passages: dict | None = None) -> None:
     from paper_adversary.config import FullTextConfig
     from paper_adversary.passages import SourceText, describe_location, match_passage
     from paper_adversary.search.fulltext import FullTextStore, describe, read_snapshot, snapshot_key
@@ -188,6 +192,12 @@ def _add_prior_tools(mcp: MCPServer, run_dir: Path, log, mode: str, scope: set[s
         return {"key": result.key, "sha256": result.sha256, "source": result.source, "status": result.status,
                 "reason": result.reason}
 
+    def failed(tool: str, args: dict, result, refusal: str | None = None) -> None:
+        """One search_log row for a call that returned no text (refused, or no full text), with the same
+        arguments as the tool's success rows, so the log has a row for every call."""
+        log(tool, args, {"status": "refused", "reason": refusal[:200]} if refusal
+            else summary(result) if result else {"status": "none"})
+
     @mcp.tool()
     async def read_prior_paper(identifier: str, section: str | None = None, page: int | None = None,
                                part: int = 1) -> str:
@@ -203,28 +213,31 @@ def _add_prior_tools(mcp: MCPServer, run_dir: Path, log, mode: str, scope: set[s
             page: A PDF page number.
             part: 1-based part number for long texts (about 30,000 characters each).
         """
+        args = {"identifier": identifier, "section": section, "page": page, "part": part}
         result, refusal = await fetch(identifier)
-        if refusal:
-            return refusal
-        if result is None or not result.available:
-            log("read_prior_paper", {"identifier": identifier}, summary(result) if result else {"status": "none"})
-            return describe(result) if result else f"FULL TEXT UNAVAILABLE: {identifier} is not in this run's papers."
+        if refusal or result is None or not result.available:
+            failed("read_prior_paper", args, result, refusal)
+            return refusal or (describe(result) if result else
+                               f"FULL TEXT UNAVAILABLE: {identifier} is not in this run's papers.")
         text = result.text_md or ""
         label = "whole text"
         if section:
             sec = next((s for s in result.sections if s["id"] == section.strip().upper()), None)
             if sec is None:
+                log("read_prior_paper", args, {**summary(result), "error": "no such section"})
                 return f"No section '{section}'. Valid IDs: " + ", ".join(s["id"] for s in result.sections)
             text, label = text[sec["start"] : sec["end"]], f"section {sec['id']} {sec['title']}"
         elif page is not None:
             m = re.search(rf"<!-- page {int(page)} -->", text)
             if not m:
+                log("read_prior_paper", args, {**summary(result), "error": "no such page"})
                 return f"No page {page} in this text (page markers exist only for PDF sources)."
             nxt = re.search(r"<!-- page \d+ -->", text[m.end():])
             text, label = text[m.start() : m.end() + (nxt.start() if nxt else len(text))], f"page {page}"
         parts = max(1, -(-len(text) // PRIOR_PART_CHARS))
         part = max(1, int(part))
         if part > parts:
+            log("read_prior_paper", args, {**summary(result), "error": "no such part"})
             return f"The {label} has only {parts} part(s)."
         chunk = text[(part - 1) * PRIOR_PART_CHARS : part * PRIOR_PART_CHARS]
         head = describe(result) + "\n"
@@ -233,8 +246,7 @@ def _add_prior_tools(mcp: MCPServer, run_dir: Path, log, mode: str, scope: set[s
                              + (f" (p. {s['page_start']})" if s.get("page_start") else "") for s in result.sections)
             head += f"Table of contents:\n{toc or '(no sections detected)'}\n"
         more = f"\n\n[part {part} of {parts}; call again with part={part + 1}]" if part < parts else ""
-        log("read_prior_paper", {"identifier": identifier, "section": section, "page": page, "part": part},
-            {**summary(result), "chars": len(chunk)})
+        log("read_prior_paper", args, {**summary(result), "chars": len(chunk)})
         return f"{head}\n[{label}, part {part} of {parts}]\n\n{chunk}{more}"
 
     @mcp.tool()
@@ -247,10 +259,9 @@ def _add_prior_tools(mcp: MCPServer, run_dir: Path, log, mode: str, scope: set[s
             max_hits: Maximum passages returned (1-20).
         """
         result, refusal = await fetch(identifier)
-        if refusal:
-            return refusal
-        if result is None or not result.available:
-            return describe(result) if result else f"FULL TEXT UNAVAILABLE: {identifier}"
+        if refusal or result is None or not result.available:  # logged too (K1: 3 such calls were missing)
+            failed("find_in_prior_paper", {"identifier": identifier, "query": query}, result, refusal)
+            return refusal or (describe(result) if result else f"FULL TEXT UNAVAILABLE: {identifier}")
         text = result.text_md or ""
         words = [w for w in re.findall(r"[^\W_]+", query.lower()) if len(w) > 2]
         phrase = " ".join(words)
@@ -282,10 +293,9 @@ def _add_prior_tools(mcp: MCPServer, run_dir: Path, log, mode: str, scope: set[s
         """
         if identifier:
             result, refusal = await fetch(identifier)
-            if refusal:
-                return refusal
-            if result is None or not result.available:
-                return describe(result) if result else f"FULL TEXT UNAVAILABLE: {identifier}"
+            if refusal or result is None or not result.available:
+                failed("check_quote", {"identifier": identifier, "chars": len(passage)}, result, refusal)
+                return refusal or (describe(result) if result else f"FULL TEXT UNAVAILABLE: {identifier}")
             src = source_for(result)
             target = result.title or identifier
         else:
@@ -295,8 +305,9 @@ def _add_prior_tools(mcp: MCPServer, run_dir: Path, log, mode: str, scope: set[s
                                                   index.get("sections"))
             src, target = holder["submission"], "the submission"
         m = match_passage(passage, src)
+        inside = _inside_passages(passage) if not identifier and passages else None
         log("check_quote", {"identifier": identifier, "chars": len(passage)},
-            {"status": m.status, "score": round(m.score, 3)})
+            {"status": m.status, "score": round(m.score, 3), **({} if inside is None else {"in_passages": inside})})
         lines = [f"{m.status.upper()} in {target}" + (f" at {m.location['label']}" if m.location else "")
                  + f" (score {m.score:.2f}, coverage {m.coverage:.2f})"]
         if m.flags:
@@ -305,7 +316,24 @@ def _add_prior_tools(mcp: MCPServer, run_dir: Path, log, mode: str, scope: set[s
             lines.append(f"Closest text in the source: {m.canonical[:800]}")
         if not m.accepted:
             lines.append("This would not count as a verbatim quote. Copy the text exactly from the source.")
+        if inside:
+            lines.append(f"Inside your passage(s) {', '.join(inside)}: it counts as a submission quote for "
+                         f"{'it' if len(inside) == 1 else 'them'}.")
+        elif inside is not None:
+            pids = ", ".join(p["pid"] for p in passages["passages"])
+            lines.append(f"NOT INSIDE ANY OF YOUR PASSAGES ({pids}): a submission quote from outside the passage "
+                         "under examination does not count as overlap evidence. Quote from the passage's own text.")
         return "\n".join(lines)
+
+    def _inside_passages(passage: str) -> list[str]:
+        """The passages a submission quote lies in, matched as verification._verdicts matches it (4+ words)."""
+        if "passages" not in holder:
+            holder["passages"] = {p["pid"]: SourceText(p["text"]) for p in passages["passages"]}
+        texts = holder["passages"]
+        score = float(passages.get("accept_approximate_score", 1.01))
+        return [pid for pid, src in texts.items()
+                if match_passage(passage, src, min_words=4,
+                                 max_words=int(passages.get("max_words", 80))).accepted_at(score)]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -320,11 +348,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--prior-text", choices=("open", "scoped"), default=None)
     parser.add_argument("--prior-keys", default=None, help="JSON list of the prior-paper keys (scoped mode)")
     parser.add_argument("--fulltext-opts", default="{}", help="JSON: search.fulltext settings")
+    parser.add_argument("--passages", default=None, help="JSON: a verifier's passages under examination")
     args = parser.parse_args(argv)
     scope = json.loads(args.prior_keys) if args.prior_keys else None
     server = build_server(Path(args.run_dir), args.agent_id, Path(args.log_file), args.literature, args.sections,
                           json.loads(args.search_opts), args.attempt, args.prior_text, scope,
-                          json.loads(args.fulltext_opts))
+                          json.loads(args.fulltext_opts), json.loads(args.passages) if args.passages else None)
     logging.getLogger("httpx2").setLevel(logging.WARNING)  # per-request INFO lines are noise here
     try:
         server.run("stdio")

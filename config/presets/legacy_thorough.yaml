@@ -1,0 +1,109 @@
+# legacy_thorough: the configuration every run used before presets existed (kept unchanged).
+#
+# Fable 5.1 at max effort for rigor, judges, synthesis and the follow-up adjudicators and memo; four novelty,
+# three rigor and three fit refuters with distinct lenses; three judges; up to two follow-up rounds. Runs
+# created before presets keep their own saved copy of this configuration.
+
+description: The previous default. Large single-model panels at max effort; the most thorough and the most expensive.
+lens_set: lenses_v1
+
+orchestrator:            # intake pass: metadata + claims ledger (seen only by synthesis and critic)
+  enabled: true
+  model: fable-5.1
+  effort: high
+  prompt: intake_v1
+  timeout_minutes: 30
+
+novelty:
+  model: opus-5.5
+  effort: high
+  agents: 4
+  prompt: novelty_v2     # v2: decisive overlaps must be shown with verbatim full-text passages
+  lenses: true           # give each agent a different primary focus (see prompts/lenses_v1.yaml)
+  tools: [web_search, web_fetch, literature, prior_text]
+  paper_format: text
+  timeout_minutes: 75
+
+rigor:
+  model: fable-5.1
+  effort: max
+  agents: 3
+  prompt: rigor_v1
+  lenses: true
+  tools: []
+  paper_format: pdf      # PDF inputs: agents also get the original PDF (read-only, sandboxed)
+  timeout_minutes: 90
+
+fit:
+  model: opus-5.5
+  effort: high
+  agents: 3
+  prompt: fit_v1
+  lenses: true
+  tools: []
+  paper_format: text
+  timeout_minutes: 60
+
+verifier:                # blind verifiers: one per cited prior paper behind a decisive novelty objection
+  enabled: true
+  model: opus-5.5
+  effort: high
+  prompt: verifier_v1
+  tools: [prior_text]    # scoped: only the paper it was given, read from this run's snapshot, no network
+  paper_format: text
+  timeout_minutes: 45
+  max_agents_per_batch: 4
+  max_agents_per_run: 8
+  max_papers_per_run: 8  # distinct prior papers that get a blind verification in one run
+  blocking: false        # judges proceed; a missing verification becomes an evidence-gate label
+
+judge:
+  model: fable-5.1
+  effort: max
+  agents: 3
+  prompt: judge_v2
+  lenses: false          # judges get identical instructions; independence comes from isolation
+  tools: []
+  paper_format: pdf
+  timeout_minutes: 90
+
+synthesis:
+  model: fable-5.1
+  effort: max
+  agents: 1
+  prompt: synthesis_v3   # v3: entries of sections 5-6 lead with their IDs (checked; misfiled threats are sent back)
+  tools: []
+  paper_format: text
+  timeout_minutes: 90
+
+critic:
+  model: fable-5.1
+  effort: xhigh
+  agents: 1
+  prompt: critic_v2      # v2: every finding is also a typed item for the follow-up round
+  tools: []
+  paper_format: text
+  timeout_minutes: 90
+
+followup:                # after the critic: verify its items, two blind adjudicators, a revised memo, a re-check
+  auto_start: true       # run_full_review starts round 1 when the critic raises an item at min_severity or above
+  auto_continue: true    # the next round starts when the re-check finds new items, up to max_rounds
+  max_rounds: 2          # per run, these may only be lowered or switched off
+  min_severity: MAJOR_FIXABLE   # items below this are noted in the revised memo without adjudication
+  adjudicators: 2
+  adjudicator:
+    model: fable-5.1
+    effort: max
+    prompt: adjudicator_v1
+    paper_format: pdf
+    timeout_minutes: 90
+  revision:
+    model: fable-5.1
+    effort: max
+    prompt: synthesis_revision_v2
+    timeout_minutes: 90
+  recheck:
+    model: fable-5.1
+    effort: xhigh
+    prompt: critic_recheck_v1
+    timeout_minutes: 90

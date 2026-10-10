@@ -42,7 +42,7 @@ def worker_info(store: RunStore) -> dict:
 
 
 def launch(store: RunStore, stages: list[str], rerun: list[str] | None = None, allow_incomplete: bool = False,
-           settle_seconds: float = 8.0) -> dict:
+           settle_seconds: float = 8.0, refresh_stale: bool = False) -> dict:
     """Start a detached worker for `stages`. Raises WorkerBusy if one is already running."""
     if lock_is_held(store.lock_path):
         info = worker_info(store)
@@ -54,6 +54,8 @@ def launch(store: RunStore, stages: list[str], rerun: list[str] | None = None, a
         cmd += ["--rerun", ",".join(rerun)]
     if allow_incomplete:
         cmd.append("--allow-incomplete")
+    if refresh_stale:
+        cmd.append("--refresh-stale")
     log_path = store.dir / "logs" / "worker.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     kwargs: dict = {"stdin": subprocess.DEVNULL, "stderr": subprocess.STDOUT, "close_fds": True,
@@ -119,7 +121,8 @@ def cancel(store: RunStore, grace_seconds: float = 25.0) -> dict:
     return {"cancelled": True, "pid": pid, "forced": True}
 
 
-def worker_main(run_dir: str, stages: list[str], rerun: list[str], allow_incomplete: bool) -> int:
+def worker_main(run_dir: str, stages: list[str], rerun: list[str], allow_incomplete: bool,
+                refresh_stale: bool = False) -> int:
     load_dotenv_into_environ()
     store = RunStore(run_dir)
     lock = FileLock(store.lock_path)
@@ -138,7 +141,7 @@ def worker_main(run_dir: str, stages: list[str], rerun: list[str], allow_incompl
     print(f"[{started}] worker {os.getpid()} starting stages {stages} rerun={rerun}", flush=True)
     outcome: dict = {"outcome": "crashed", "message": ""}
     try:
-        outcome = asyncio.run(_amain(store, stages, rerun, allow_incomplete))
+        outcome = asyncio.run(_amain(store, stages, rerun, allow_incomplete, refresh_stale))
         return 0
     except Exception as exc:  # recorded for get_run_status; the run stays resumable
         outcome = {"outcome": "crashed", "message": f"{type(exc).__name__}: {exc}"}
@@ -153,7 +156,8 @@ def worker_main(run_dir: str, stages: list[str], rerun: list[str], allow_incompl
         lock.release()
 
 
-async def _amain(store: RunStore, stages: list[str], rerun: list[str], allow_incomplete: bool) -> dict:
+async def _amain(store: RunStore, stages: list[str], rerun: list[str], allow_incomplete: bool,
+                 refresh_stale: bool = False) -> dict:
     from paper_adversary.pipeline import Pipeline
 
     pipeline = Pipeline(store)
@@ -161,7 +165,7 @@ async def _amain(store: RunStore, stages: list[str], rerun: list[str], allow_inc
     if sys.platform != "win32":
         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
             loop.add_signal_handler(sig, pipeline.cancel.set)
-    return await pipeline.run(stages, rerun=rerun, allow_incomplete=allow_incomplete)
+    return await pipeline.run(stages, rerun=rerun, allow_incomplete=allow_incomplete, refresh_stale=refresh_stale)
 
 
 async def wait_until_idle(store: RunStore, seconds: float, on_tick=None) -> bool:

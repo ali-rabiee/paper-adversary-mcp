@@ -1,114 +1,20 @@
-# Default pipeline configuration.
+# Default pipeline configuration: settings shared by every preset.
 #
-# Model names are aliases resolved through config/models.yaml, so no model ID is
-# hard-coded in the orchestration code. Per-run overrides (create_review_run's
-# `config_override`) are deep-merged over this file, then over the optional
-# user file named by $PAPER_ADVERSARY_CONFIG.
+# Who reviews (agents, models, efforts, lenses, verification and follow-up limits) comes from a preset in
+# config/presets/<name>.yaml; `preset` below is the default for new runs. Model names are aliases resolved
+# through config/models.yaml, so no model ID is hard-coded in the orchestration code.
+#
+# Order of precedence (later wins): this file -> the preset -> $PAPER_ADVERSARY_CONFIG (your standing,
+# trusted settings) -> `--trusted-config FILE` on the CLI (trusted) -> a run's `config_override` (per run,
+# restricted: it may not raise agent counts or limits, enable max effort, or touch protected keys).
 #
 # effort: low | medium | high | xhigh | max   (passed to `claude --effort`)
 
-orchestrator:            # intake pass: metadata + claims ledger (seen only by synthesis and critic)
-  enabled: true
-  model: fable-5.1
-  effort: high
-  prompt: intake_v1
-  timeout_minutes: 30
-
-novelty:
-  model: opus-5.5
-  effort: high
-  agents: 4
-  prompt: novelty_v2     # v2: decisive overlaps must be shown with verbatim full-text passages
-  lenses: true           # give each agent a different primary focus (see prompts/lenses_v1.yaml)
-  tools: [web_search, web_fetch, literature, prior_text]
-  paper_format: text
-  timeout_minutes: 75
-
-rigor:
-  model: fable-5.1
-  effort: max
-  agents: 3
-  prompt: rigor_v1
-  lenses: true
-  tools: []
-  paper_format: pdf      # PDF inputs: agents also get the original PDF (read-only, sandboxed)
-  timeout_minutes: 90
-
-fit:
-  model: opus-5.5
-  effort: high
-  agents: 3
-  prompt: fit_v1
-  lenses: true
-  tools: []
-  paper_format: text
-  timeout_minutes: 60
-
-verifier:                # blind verifiers: one per cited prior paper behind a decisive novelty objection
-  enabled: true
-  model: opus-5.5
-  effort: high
-  prompt: verifier_v1
-  tools: [prior_text]    # scoped: only the paper it was given, read from this run's snapshot, no network
-  paper_format: text
-  timeout_minutes: 45
-  max_agents_per_batch: 4
-  max_agents_per_run: 8
-  blocking: false        # judges proceed; a missing verification becomes an evidence-gate label
-
-judge:
-  model: fable-5.1
-  effort: max
-  agents: 3
-  prompt: judge_v2
-  lenses: false          # judges get identical instructions; independence comes from isolation
-  tools: []
-  paper_format: pdf
-  timeout_minutes: 90
-
-synthesis:
-  model: fable-5.1
-  effort: max
-  agents: 1
-  prompt: synthesis_v3   # v3: entries of sections 5-6 lead with their IDs (checked; misfiled threats are sent back)
-  tools: []
-  paper_format: text
-  timeout_minutes: 90
-
-critic:
-  model: fable-5.1
-  effort: xhigh
-  agents: 1
-  prompt: critic_v2      # v2: every finding is also a typed item for the follow-up round
-  tools: []
-  paper_format: text
-  timeout_minutes: 90
-
-followup:                # after the critic: verify its items, two blind adjudicators, a revised memo, a re-check
-  auto_start: true       # run_full_review starts round 1 when the critic raises an item at min_severity or above
-  auto_continue: true    # the next round starts when the re-check finds new items, up to max_rounds
-  max_rounds: 2          # per run, these may only be lowered or switched off
-  min_severity: MAJOR_FIXABLE   # items below this are noted in the revised memo without adjudication
-  adjudicators: 2
-  adjudicator:
-    model: fable-5.1
-    effort: max
-    prompt: adjudicator_v1
-    paper_format: pdf
-    timeout_minutes: 90
-  revision:
-    model: fable-5.1
-    effort: max
-    prompt: synthesis_revision_v2
-    timeout_minutes: 90
-  recheck:
-    model: fable-5.1
-    effort: xhigh
-    prompt: critic_recheck_v1
-    timeout_minutes: 90
+preset: routine          # routine | milestone | legacy_thorough (config/presets/)
+presets:
+  selectable: [routine, milestone, legacy_thorough]   # presets a run may pick; trusted settings only
 
 rubric: default_v1       # prompts/rubrics/<name>.md, or pass rubric text/path per run
-lens_set: lenses_v1      # prompts/<lens_set>.yaml
 
 provider:
   type: claude_code      # claude_code (your Claude plan, headless `claude -p`) | mock (offline testing)
@@ -134,8 +40,11 @@ retry:
 
 plan_limit:
   policy: wait           # wait (sleep until the limit resets, then continue) | fail
+  max_waits_per_run: 1   # automatic waits per run; after that the job stops with a resumable state
   max_wait_hours: 6
   default_wait_minutes: 30   # when the reset time cannot be parsed
+  model_window_reserve: 0    # share of a model-specific window (Fable's weekly) a run needs; before a run's first
+                             # agent on that model, last known use + this must stay <= 100%. 0 = no check. Trusted only.
 
 search:
   providers: [openalex, semantic_scholar, arxiv, crossref]
@@ -166,6 +75,17 @@ evidence:                # when a FATAL/MAJOR verdict on prior work counts as sh
   min_prior_words: 12
   min_submission_words: 8
   max_words: 80
+
+verifier:                # the rest of the verifier section (models, per-run caps) comes from the preset
+  # Each kind of verification batch has its own budget, so the refuters' batch (verifier.max_papers_per_run and
+  # max_agents_per_run, set by the preset) cannot use up what follow-up rounds and gate re-checks need.
+  # Trusted limits: a per-run override may lower them, never raise them.
+  max_papers_per_followup_round: 2   # prior papers verified for one follow-up round's critic items
+  max_agents_per_followup_round: 2
+  max_papers_per_user_batch: 2       # each run_verification batch (from_gate or your own requests)
+  max_agents_per_user_batch: 2
+  auto_gate_batch: false   # true: right after the judges, one gate batch for objections the judges escalated that
+                           # were never sent for an independent check (within the batch budget above)
 
 budget:
   chars_per_token: 3.2   # conservative heuristic; replaced by a calibrated ratio once agents report usage

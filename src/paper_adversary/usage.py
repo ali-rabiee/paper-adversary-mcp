@@ -21,7 +21,8 @@ def _bucket() -> dict:
             "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 0,
             "web_search_requests": 0, "web_fetch_requests": 0, "reported_cost_usd": 0.0,
             "reported_cost_missing": 0, "estimated_cost_usd": 0.0, "estimate_incomplete": False,
-            "agent_seconds": 0.0, "api_seconds": 0.0, "models": set(), "missing": []}
+            "agent_seconds": 0.0, "api_seconds": 0.0, "models": set(), "missing": [],
+            "hidden_turns": 0, "hidden_output_tokens": 0, "hidden_cost_usd": 0.0, "hidden": []}
 
 
 def _mu(entry: dict, *keys: str) -> int:
@@ -102,6 +103,15 @@ def summarize(records: list[dict], registry: ModelRegistry) -> dict:
         if est is None or unknown:
             b["estimate_incomplete"] = True
         b["estimated_cost_usd"] += est or 0.0
+        hidden = rec.get("hidden_turns") or {}
+        if hidden.get("count"):  # output the report does not contain (already in the token counts above)
+            tokens = int(hidden.get("output_tokens") or 0)
+            info = registry.by_id(rec.get("model_requested") or "")
+            b["hidden_turns"] += int(hidden["count"])
+            b["hidden_output_tokens"] += tokens
+            b["hidden_cost_usd"] += tokens * ((info.pricing if info else {}) or {}).get("output", 0) / 1_000_000
+            b["hidden"].append(f"{rec.get('agent_id')} attempt {rec.get('attempt')}: {hidden['count']} turn(s), "
+                               f"{_k(tokens)} output tokens")
     total = _bucket()
     for b in phases.values():
         for key, val in b.items():
@@ -166,5 +176,10 @@ def cost_markdown(run_id: str, summary: dict, provider: str) -> str:
         notes.append("* some calls had no reported cost")
     if total["estimate_incomplete"]:
         notes.append("* the estimate skips models without prices in config/models.yaml")
+    if total["hidden_turns"]:
+        notes.append(f"Hidden turns: {total['hidden_turns']} turn(s) before agents' final messages used "
+                     f"{_k(total['hidden_output_tokens'])} output tokens (about ${total['hidden_cost_usd']:.2f} at "
+                     "models.yaml output prices; included above) whose text no report contains: "
+                     + "; ".join(total["hidden"][:12]))
     notes.append(f"Prices: {summary.get('pricing_source') or 'config/models.yaml'}")
     return "\n".join(rows + [""] + notes) + "\n"
