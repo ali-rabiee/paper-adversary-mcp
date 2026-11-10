@@ -1,0 +1,156 @@
+# icml_judge_matrix: ICML 2027 K14 method review, 2026-10-20, the user's choices: judges 2 models × high/xhigh/max;
+# mid panel; no follow-up; judge_v4 scores.
+#
+# Judges: six, one per cell of a model x effort matrix (J1-J3 Opus 5.5 at high, xhigh and max; J4-J6 Fable 5.1 at
+# high, xhigh and max), all on judge_v4 (judge_v3 plus each judge's own ICML-style scores and probability of
+# acceptance). Mid panel: novelty Opus 5.5 high (direct_and_recent) and Fable 5.1 high (equivalents_and_gaps);
+# rigor Fable 5.1 xhigh (theory) and Opus 5.5 high (empirical_and_claims); fit Opus 5.5 high (fit_overall);
+# intake Opus 5.5 high; synthesis memo Fable 5.1 max; completeness critic Fable 5.1 xhigh. Blind verifiers as in
+# stage2_split. No follow-up rounds (followup.auto_start: false; max_rounds 0, below). The window guard reserves 25%
+# of a model-specific weekly window (Fable 5.1's) per run.
+#
+# Everything not named above is taken from config/default.yaml or stage2_split, whichever is safer:
+# - lens_set lenses_v2, paper_format text, refuter tools and the newest prompt versions: as stage2_split;
+# - verifier: stage2_split's section unchanged (cross_model, verifier_v2, caps 3, auto_gate_batch on, which only
+#   spends the gate batch's own default budget of 2 papers and 2 verifiers);
+# - followup: auto_start false as chosen, plus max_rounds 0 (stage2_split has 1, the default 2). auto_start only
+#   keeps `review` and run_full_review from starting a round; `resume --through followup`, `followup` and
+#   run_followup would still start one while max_rounds is 1. With 0 no path runs a round (the pipeline reports the
+#   follow-up as disabled); allowing one later needs trusted settings. auto_continue false as stage2_split (the
+#   default is true). The panel below is stage2_split's, listed only because the schema requires one;
+# - plan_limit policy, waits and wait hours, concurrency (3 agents at a time), retries, search, evidence and every
+#   gate: the defaults, which stage2_split leaves unchanged too.
+# Max effort appears here, so this preset is trusted configuration: select it with `preset: icml_judge_matrix` in a
+# --trusted-config file, never per run.
+
+description: ICML 2027 K14 method review. Six judge_v4 judges (Opus 5.5 and Fable 5.1, each at high, xhigh and max) with ICML-style scores; mid panel of refuters; Fable 5.1 max memo and xhigh critic; no follow-up rounds.
+lens_set: lenses_v2
+
+orchestrator:
+  enabled: true
+  model: opus-5.5
+  effort: high
+  prompt: intake_v1
+  timeout_minutes: 30
+
+novelty:
+  model: opus-5.5
+  effort: high
+  agents: 2
+  prompt: novelty_v3
+  lenses: true
+  per_agent:
+    1: {model: opus-5.5, effort: high, lens: direct_and_recent}
+    2: {model: fable-5.1, effort: high, lens: equivalents_and_gaps}
+  tools: [web_search, web_fetch, literature, prior_text]
+  paper_format: text
+  timeout_minutes: 90
+
+rigor:
+  model: fable-5.1
+  effort: xhigh
+  agents: 2
+  prompt: rigor_v2
+  lenses: true
+  per_agent:
+    1: {model: fable-5.1, effort: xhigh, lens: theory}
+    2: {model: opus-5.5, effort: high, lens: empirical_and_claims}
+  tools: []
+  paper_format: text
+  timeout_minutes: 150
+
+fit:
+  model: opus-5.5
+  effort: high
+  agents: 1
+  prompt: fit_v2
+  lenses: true
+  per_agent:
+    1: {lens: fit_overall}
+  tools: []
+  paper_format: text
+  timeout_minutes: 90
+
+verifier:                 # as in stage2_split
+  enabled: true
+  routing: cross_model
+  counterpart: {opus-5.5: fable-5.1, fable-5.1: opus-5.5}
+  model: opus-5.5
+  effort: high
+  prompt: verifier_v2
+  tools: [prior_text]
+  paper_format: text
+  timeout_minutes: 45
+  max_agents_per_batch: 3
+  max_agents_per_run: 3
+  max_papers_per_run: 3
+  max_papers_per_followup_round: 2
+  max_agents_per_followup_round: 2
+  max_papers_per_user_batch: 2
+  max_agents_per_user_batch: 2
+  auto_gate_batch: true
+  blocking: false
+
+judge:
+  model: opus-5.5
+  effort: high
+  agents: 6
+  prompt: judge_v4       # judge_v3 plus the judge's own scores (scores object; Scores section)
+  lenses: false          # identical instructions; independence comes from isolation
+  per_agent:             # the model x effort matrix
+    1: {model: opus-5.5, effort: high}
+    2: {model: opus-5.5, effort: xhigh}
+    3: {model: opus-5.5, effort: max}
+    4: {model: fable-5.1, effort: high}
+    5: {model: fable-5.1, effort: xhigh}
+    6: {model: fable-5.1, effort: max}
+  tools: []
+  paper_format: text
+  timeout_minutes: 180
+
+synthesis:
+  model: fable-5.1
+  effort: max
+  agents: 1
+  prompt: synthesis_v4
+  tools: []
+  paper_format: text
+  timeout_minutes: 150
+
+critic:
+  model: fable-5.1
+  effort: xhigh
+  agents: 1
+  prompt: critic_v3
+  tools: []
+  paper_format: text
+  timeout_minutes: 150
+
+plan_limit:
+  model_window_reserve: 0.25
+
+followup:                 # no rounds: auto_start false, and max_rounds 0 so no other path starts one (see the header)
+  auto_start: false
+  auto_continue: false
+  max_rounds: 0
+  min_severity: MAJOR_FIXABLE
+  adjudicators: 2
+  adjudicator:
+    model: fable-5.1
+    effort: max
+    per_agent:
+      1: {model: opus-5.5, effort: high}
+      2: {model: fable-5.1, effort: max}
+    prompt: adjudicator_v2
+    paper_format: text
+    timeout_minutes: 150
+  revision:
+    model: fable-5.1
+    effort: max
+    prompt: synthesis_revision_v2
+    timeout_minutes: 150
+  recheck:
+    model: fable-5.1
+    effort: high
+    prompt: critic_recheck_v2
+    timeout_minutes: 150

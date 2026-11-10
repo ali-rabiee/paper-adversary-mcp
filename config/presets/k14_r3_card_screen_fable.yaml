@@ -1,0 +1,9 @@
+# k14_r3_card_screen_fable: k14_r3_card_screen with the one novelty refuter on Fable 5.1 high, so the round's cards
+# alternate refuter models. Verifiers stay cross-model (so Opus 5.5 high here); the judge stays Opus 5.5 high.
+extends: k14_r3_card_screen
+description: K14 round 3 card novelty screen, Fable variant. One novelty refuter (Fable 5.1 high, component_anticipation), cross-model blind verifiers at high (Opus; max 3 papers), one judge_v3 judge (Opus 5.5 high); no rigor, fit, synthesis, critic or follow-up.
+
+novelty:
+  model: fable-5.1
+  per_agent:
+    1: {model: fable-5.1, effort: high, lens: component_anticipation}

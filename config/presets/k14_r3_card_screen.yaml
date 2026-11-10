@@ -1,0 +1,141 @@
+# k14_r3_card_screen: one blind novelty screen of one method card (K14 method round 3, stream E, 2026-10-20;
+# PREREG A123-A125; the coordinator's spec: "one blind novelty screen per card, with verified quotes and cross-model
+# verifiers at high effort").
+#
+# Run per card: `create <card.md> --type idea --rubric <rubric> --trusted-config <screen_trusted*.yaml>`, then
+# `refuters <run> --phase novelty`, then `judges <run> --allow-incomplete` (it verifies the refuter's decisive
+# objections blind, then runs the one judge). Synthesis, critic and follow-up are never run for these screens.
+#
+# - Novelty: ONE refuter, Opus 5.5 high, lens component_anticipation (lenses_k14r3). The _fable variant swaps the
+#   refuter to Fable 5.1 high, so cards alternate models.
+# - Verifiers: cross-model (the other model than the refuter), high effort, verifier_v2, at most 3 prior papers; no
+#   automatic gate batch (cost bound).
+# - Judge: ONE, Opus 5.5 high, judge_v3 (rules on the rubric's tests; no ICML scores).
+# - Rigor, fit, synthesis, critic: present only because the schema requires them; the screen never runs them.
+# - Intake (orchestrator) off: its claims ledger is read only by synthesis and the critic.
+# - Follow-up: off (max_rounds 0).
+# Max effort appears nowhere. Trusted configuration: select it with `preset:` in a --trusted-config file.
+
+description: K14 round 3 card novelty screen. One novelty refuter (Opus 5.5 high, component_anticipation), cross-model blind verifiers at high (max 3 papers), one judge_v3 judge (Opus 5.5 high); no rigor, fit, synthesis, critic or follow-up.
+lens_set: lenses_k14r3
+
+orchestrator:
+  enabled: false
+  model: opus-5.5
+  effort: high
+  prompt: intake_v1
+  timeout_minutes: 30
+
+novelty:
+  model: opus-5.5
+  effort: high
+  agents: 1
+  prompt: novelty_v3
+  lenses: true
+  per_agent:
+    1: {model: opus-5.5, effort: high, lens: component_anticipation}
+  tools: [web_search, web_fetch, literature, prior_text]
+  paper_format: text
+  timeout_minutes: 90
+
+rigor:                    # never run by the screen
+  model: opus-5.5
+  effort: high
+  agents: 1
+  prompt: rigor_v2
+  lenses: true
+  per_agent:
+    1: {model: opus-5.5, effort: high, lens: theory}
+  tools: []
+  paper_format: text
+  timeout_minutes: 90
+
+fit:                      # never run by the screen
+  model: opus-5.5
+  effort: high
+  agents: 1
+  prompt: fit_v2
+  lenses: true
+  per_agent:
+    1: {lens: fit_overall}
+  tools: []
+  paper_format: text
+  timeout_minutes: 60
+
+verifier:
+  enabled: true
+  routing: cross_model
+  counterpart: {opus-5.5: fable-5.1, fable-5.1: opus-5.5}
+  model: opus-5.5
+  effort: high
+  prompt: verifier_v2
+  tools: [prior_text]
+  paper_format: text
+  timeout_minutes: 45
+  max_agents_per_batch: 3
+  max_agents_per_run: 3
+  max_papers_per_run: 3
+  max_papers_per_followup_round: 0
+  max_agents_per_followup_round: 0
+  max_papers_per_user_batch: 2
+  max_agents_per_user_batch: 2
+  auto_gate_batch: false
+  blocking: false
+
+judge:
+  model: opus-5.5
+  effort: high
+  agents: 1
+  prompt: judge_v3
+  lenses: false
+  per_agent:
+    1: {model: opus-5.5, effort: high}
+  tools: []
+  paper_format: text
+  timeout_minutes: 90
+
+synthesis:                # never run by the screen
+  model: opus-5.5
+  effort: high
+  agents: 1
+  prompt: synthesis_v4
+  tools: []
+  paper_format: text
+  timeout_minutes: 90
+
+critic:                   # never run by the screen
+  model: opus-5.5
+  effort: high
+  agents: 1
+  prompt: critic_v3
+  tools: []
+  paper_format: text
+  timeout_minutes: 90
+
+plan_limit:
+  model_window_reserve: 0.25
+
+followup:
+  auto_start: false
+  auto_continue: false
+  max_rounds: 0
+  min_severity: MAJOR_FIXABLE
+  adjudicators: 1
+  adjudicator:
+    model: opus-5.5
+    effort: high
+    per_agent:
+      1: {model: opus-5.5, effort: high}
+    prompt: adjudicator_v2
+    paper_format: text
+    timeout_minutes: 90
+  revision:
+    model: opus-5.5
+    effort: high
+    prompt: synthesis_revision_v2
+    timeout_minutes: 90
+  recheck:
+    model: opus-5.5
+    effort: high
+    prompt: critic_recheck_v2
+    timeout_minutes: 90
